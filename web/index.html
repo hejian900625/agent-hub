@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Hub · 多智能体指挥台</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#121722; --panel2:#161d2b; --line:#1f2937;
+    --txt:#e6edf7; --dim:#7d8da6; --acc:#38bdf8;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;height:100vh;display:flex;flex-direction:column;background:var(--bg);color:var(--txt);
+       font:13px/1.55 ui-monospace,"Cascadia Code",Consolas,"Microsoft YaHei",monospace}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:14px;margin:0;letter-spacing:.5px}
+  .dot{width:7px;height:7px;border-radius:50%;background:#ef4444;display:inline-block;margin-right:6px}
+  .dot.on{background:#22c55e;box-shadow:0 0 8px #22c55e}
+  .spacer{flex:1}
+  .tabs{display:flex;gap:2px}
+  .tab{padding:4px 12px;border-radius:6px;cursor:pointer;color:var(--dim);border:1px solid transparent}
+  .tab.active{background:var(--panel2);color:var(--txt);border-color:var(--line)}
+  main{flex:1;display:grid;grid-template-columns:260px 1fr;min-height:0}
+  aside{border-right:1px solid var(--line);overflow:auto;padding:12px;background:var(--panel)}
+  .agent{border:1px solid var(--line);border-radius:10px;padding:10px;margin-bottom:10px;background:var(--panel2);
+         cursor:pointer;transition:.15s;position:relative;overflow:hidden}
+  .agent:hover{border-color:#334155;transform:translateY(-1px)}
+  .agent.sel{border-color:var(--c);box-shadow:0 0 0 1px var(--c) inset}
+  .agent .nm{display:flex;align-items:center;gap:8px;font-weight:600}
+  .agent .vd{color:var(--dim);font-size:11px;margin-top:2px;line-height:1.7}
+  .agent .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
+  .tag{font-size:10px;padding:1px 6px;border-radius:999px;background:#0f172a;color:var(--dim);border:1px solid var(--line)}
+  .tag.hot{color:var(--c);border-color:color-mix(in srgb,var(--c) 40%,transparent)}
+  .sw{width:9px;height:9px;border-radius:3px;background:var(--c)}
+  section{display:flex;flex-direction:column;min-height:0}
+  #log{flex:1;overflow:auto;padding:14px 18px;scroll-behavior:smooth}
+  .row{margin-bottom:3px;white-space:pre-wrap;word-break:break-word}
+  .row .who{font-weight:600;margin-right:8px}
+  .row.text{color:var(--txt)}
+  .row.thinking{color:#64748b;font-style:italic}
+  .row.log{color:#64748b;font-size:11.5px}
+  .row.err{color:#f87171}
+  .row.tool{color:#fbbf24}
+  .row.res{color:#34d399;font-size:12px}
+  .row.sys{color:var(--acc);font-size:11.5px}
+  footer{border-top:1px solid var(--line);background:var(--panel);padding:10px 14px;display:flex;flex-direction:column;gap:8px}
+  .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  #models{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  .mrow{display:flex;gap:6px;align-items:center;font-size:12px}
+  input[type=text],textarea,select{background:#0a0f18;border:1px solid var(--line);color:var(--txt);
+        border-radius:8px;padding:8px 10px;font:inherit;outline:none}
+  input:focus,textarea:focus{border-color:var(--acc)}
+  textarea{flex:1;resize:none;height:52px}
+  button{background:#1d4ed8;border:0;color:#fff;padding:8px 16px;border-radius:8px;cursor:pointer;font:inherit}
+  button:hover{background:#2563eb}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--dim)}
+  .chk{display:flex;align-items:center;gap:5px;color:var(--dim);cursor:pointer;font-size:12px}
+  .chk input{accent-color:var(--acc)}
+  .hint{color:var(--dim);font-size:11px}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>AGENT HUB</h1>
+  <span class="hint" id="conn">连接中…</span>
+  <button class="ghost" id="reauth" title="重新探测各家登录状态（trae 会解密 storage.json 查积分）">刷新登录状态</button>
+  <div class="spacer"></div>
+  <div class="tabs">
+    <div class="tab active" data-mode="single">单发</div>
+    <div class="tab" data-mode="fanout">并行分发</div>
+    <div class="tab" data-mode="chain">链式流水</div>
+  </div>
+</header>
+
+<main>
+  <aside id="agents"></aside>
+  <section>
+    <div id="log"></div>
+    <footer>
+      <div class="bar">
+        <span class="hint">工作目录</span>
+        <input type="text" id="cwd" style="flex:1;max-width:520px" placeholder="C:\\path\\to\\project">
+      </div>
+      <div class="bar" id="modelbar" style="display:none">
+        <!-- 每个选中的 agent 一行模型下拉：并行/链式时各自选各自的，不再只认第一个 -->
+        <div id="models"></div>
+        <span class="hint" id="modelhint"></span>
+      </div>
+      <div class="bar">
+        <textarea id="prompt" placeholder="输入指令…（Ctrl+Enter 发送）"></textarea>
+        <button id="send">派发</button>
+        <button class="ghost" id="clear">清屏</button>
+      </div>
+      <div class="bar" id="targets"></div>
+    </footer>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s)
+const logEl = $('#log')
+let agents = []
+let selected = new Set()
+let mode = 'single'
+
+/* ---------- 拉取 agent 列表 ---------- */
+async function loadAgents(fresh) {
+  const r = await fetch('/api/agents' + (fresh ? '?fresh=1' : '')).then((x) => x.json())
+  agents = r.agents
+  renderAgents()
+  renderTargets()
+}
+function renderAgents() {
+  $('#agents').innerHTML = agents.map((a) => {
+    const ok = a.auth?.status === 'ok'
+    const live = a.live
+    let liveBadge = ''
+    if (live && a.id === 'trae') {
+      const credit = live.credits != null ? live.credits + ' 积分' : '积分?'
+      const cdpOn = live.cdp?.up
+      liveBadge = live.up
+        ? `<span style="color:#22c55e;font-size:10px">● ${credit}</span> <span style="color:${cdpOn ? '#22c55e' : '#f59e0b'};font-size:10px">${cdpOn ? 'CDP 就绪' : 'CDP 未开'}</span>`
+        : `<span style="color:#ef4444;font-size:10px">○ 客户端未登录</span>`
+    } else if (live && a.id === 'workbuddy') {
+      // WorkBuddy 的 up = 有登录会话在等浏览器；models 来自桌面版 product.json
+      const m = live.models ? `${live.models} 模型` : ''
+      liveBadge = live.loginPending
+        ? `<span style="color:#22c55e;font-size:10px">● 正在登录</span> <span style="color:#7d8da6;font-size:10px">${m}</span>`
+        : `<span style="color:#7d8da6;font-size:10px">${m}</span>`
+    } else if (live && a.id === 'doubao') {
+      // 豆包只有 CDP 一条真轨，up = 调试端口通不通
+      liveBadge = live.up
+        ? `<span style="color:#22c55e;font-size:10px">● CDP ${live.port} 就绪</span>`
+        : `<span style="color:#f59e0b;font-size:10px">○ CDP 未开（需 --remote-debugging-port=${live.port || 9335}）</span>`
+    } else if (live && a.id === 'scnet') {
+      // SCNet 同样只有 CDP 一条真轨；额外提示要先清空 ELECTRON_RUN_AS_NODE
+      liveBadge = live.up
+        ? `<span style="color:#22c55e;font-size:10px">● CDP ${live.port} 就绪</span> <span style="color:#7d8da6;font-size:10px">${a.defaultModel || ''}</span>`
+        : `<span style="color:#f59e0b;font-size:10px">○ CDP 未开（清 ELECTRON_RUN_AS_NODE + --remote-debugging-port=${live.port || 9336}）</span>`
+    } else if (live) {
+      liveBadge = live.up
+        ? `<span style="color:#22c55e;font-size:10px">● ${(live.base || 'CDP ' + live.port).replace('http://', '')}</span>`
+        : `<span style="color:#ef4444;font-size:10px">○ 未运行</span>`
+    }
+    const authBadge = ok
+      ? `<span style="color:#22c55e;font-size:10px">已登录</span>`
+      : a.auth?.status === 'n/a'
+        ? `<span style="color:#7d8da6;font-size:10px">${a.auth?.detail || 'GUI'}</span>`
+        : `<span class="login" data-id="${a.id}" style="color:#f59e0b;font-size:10px;cursor:pointer;text-decoration:underline">未登录·点击登录</span>`
+    return `
+    <div class="agent ${selected.has(a.id) ? 'sel' : ''}" data-id="${a.id}" style="--c:${a.accent}">
+      <div class="nm"><span class="sw"></span>${a.label}<span style="margin-left:auto;color:${a.installed ? '#22c55e' : '#ef4444'};font-size:11px">${a.installed ? '●' : '○'}</span></div>
+      <div class="vd">${a.vendor} · ${authBadge}${liveBadge ? ' · ' + liveBadge : ''}</div>
+      <div class="tags">
+        ${a.transports.map((t) => `<span class="tag ${['acp','http','cdp','client'].includes(t.kind) ? 'hot' : ''}">${t.name}</span>`).join('')}
+      </div>
+    </div>`
+  }).join('')
+
+  document.querySelectorAll('.agent').forEach((el) => {
+    el.onclick = () => {
+      const id = el.dataset.id
+      if (mode === 'single') { selected.clear(); selected.add(id) }
+      else selected.has(id) ? selected.delete(id) : selected.add(id)
+      renderAgents(); renderTargets()
+    }
+  })
+  document.querySelectorAll('.login').forEach((el) => {
+    el.onclick = async (ev) => {
+      ev.stopPropagation()
+      const r = await post('/api/login', { agent: el.dataset.id })
+      const extra = r.url ? `  \n登录地址：${r.url}` : ''
+      log(r.ok ? `已启动登录流程 (pid ${r.pid})：${r.cmd}${extra}` : `登录失败：${r.error}`, r.ok ? 'sys' : 'err')
+      if (r.ok) {
+        // 登录态是异步落盘的：先快刷两次（6s / 15s），再慢刷几次兜住扫码慢的情况
+        ;[6000, 15000, 40000, 90000].forEach((ms) => setTimeout(() => loadAgents(true), ms))
+      }
+    }
+  })
+}
+function renderTargets() {
+  const pick = [...selected].map((id) => agents.find((a) => a.id === id)?.label).join(' + ') || '未选择'
+  $('#targets').innerHTML = `<span class="hint">目标：</span><b style="color:#38bdf8">${pick}</b>
+    <span class="hint" style="margin-left:12px">${mode === 'chain' ? '按选择顺序串行，前一个输出注入后一个' : mode === 'single' ? '单击切换目标' : '可多选并行'}</span>`
+  renderModel()
+}
+
+/* ---------- 模型选择（逐 agent 各自一份） ---------- */
+const modelOf = new Map() // agentId -> 该 agent 选中的模型
+
+function currentAgent() { const ids = [...selected]; return ids.length === 1 ? ids[0] : null }
+
+/** 某 agent 该用的模型：用户选过且仍有效 → 用它；否则 defaultModel → 列表首项。 */
+function modelFor(agentId) {
+  const a = agents.find((x) => x.id === agentId)
+  const list = (a && a.models) || []
+  if (!list.length) return undefined
+  const want = modelOf.get(agentId)
+  return list.includes(want) ? want : (a.defaultModel && list.includes(a.defaultModel) ? a.defaultModel : list[0])
+}
+
+/** 为每个选中的 agent 各渲染一个下拉。没有模型的 agent（纯 GUI）显示不可选提示。 */
+function renderModel() {
+  const bar = $('#modelbar')
+  const box = $('#models')
+  const hint = $('#modelhint')
+  const ids = [...selected]
+  if (!ids.length) {
+    bar.style.display = 'none'
+    return
+  }
+  bar.style.display = 'flex'
+  box.innerHTML = ids.map((id) => {
+    const a = agents.find((x) => x.id === id) || { label: id }
+    const list = a.models || []
+    const accent = a.accent || '#38bdf8'
+    if (!list.length) {
+      return `<div class="mrow"><b style="color:${accent}">${a.label}</b>`
+        + `<span class="hint">无模型可选（客户端自管）</span></div>`
+    }
+    return `<div class="mrow"><b style="color:${accent}">${a.label}</b>`
+      + `<select data-model-for="${id}" style="min-width:210px">`
+      + list.map((m) => `<option value="${esc(m)}"${m === modelFor(id) ? ' selected' : ''}>${esc(m)}</option>`).join('')
+      + `</select></div>`
+  }).join('')
+
+  // 逐个绑定：改哪个就记到哪个 agent 头上，互不影响
+  box.querySelectorAll('select[data-model-for]').forEach((sel) => {
+    const id = sel.dataset.modelFor
+    sel.onchange = () => {
+      modelOf.set(id, sel.value)
+      hint.textContent = `已为 ${label(id)} 选定 ${sel.value}`
+    }
+  })
+
+  hint.textContent = ids.length > 1
+    ? `${ids.length} 个 agent 各自用自己这一行的模型（未改动的用各自默认值）`
+    : ''
+}
+
+
+// 单发用当前下拉值；批量时逐 agent 各自取值
+const curModel = () => { const id = currentAgent(); return id ? modelFor(id) : undefined }
+
+/* ---------- 按 mode 派发 ---------- */
+async function dispatch() {
+  const prompt = $('#prompt').value.trim()
+  const cwd = $('#cwd').value.trim() || undefined
+  const ids = [...selected]
+  if (!prompt) return log('请先输入指令', 'sys')
+  if (!ids.length) return log('请先在左侧选择 agent', 'sys')
+
+  if (mode === 'single') {
+    const { runId } = await post('/api/run', { agent: ids[0], prompt, cwd, model: modelFor(ids[0]) })
+    log(`→ ${label(ids[0])} 已派发 (${runId})`, 'sys')
+  } else if (mode === 'fanout') {
+    // 先把每个 agent 的模型定下来（含默认值），再派发 —— 日志和请求体用同一份，不会对不上
+    const plan = ids.map((agent) => ({ agent, model: modelFor(agent) }))
+    log(`→ 并行分发至 ${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' / ')}`, 'sys')
+    const out = await Promise.all(plan.map((p) => post('/api/run', { agent: p.agent, prompt, cwd, model: p.model })))
+  } else {
+    // after 用「id 下标」；plan 数组里多带一个 model 字段给日志用，发出去前再剥掉
+    const plan = ids.map((agent, i) => ({ agent, prompt, cwd, model: modelFor(agent), after: i ? [i - 1] : [] }))
+    log(`→ 链式流水：${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' → ')}`, 'sys')
+    const out = await post('/api/orchestrate', { plan, cwd })
+  }
+}
+const post = (u, b) => fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json())
+const label = (id) => agents.find((a) => a.id === id)?.label || id
+const colorOf = (id) => agents.find((a) => a.id === id)?.accent || '#38bdf8'
+
+/* ---------- 日志 ---------- */
+function log(msg, cls = 'log', who) {
+  const d = document.createElement('div')
+  d.className = 'row ' + cls
+  const nearBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 80
+  d.innerHTML = (who ? `<span class="who" style="color:${colorOf(who)}">[${label(who)}]</span>` : '') + esc(msg)
+  logEl.appendChild(d)
+  if (nearBottom) logEl.scrollTop = logEl.scrollHeight
+  return d
+}
+function fmtToolInput(input) {
+  if (input == null) return ''
+  if (typeof input === 'string') return input.slice(0, 160)
+  // 常见形状：{command} / {filePath} / {pattern,path} / {description}
+  const pick = input.command || input.filePath || input.path || input.pattern || input.description
+  if (pick) return String(pick).slice(0, 160)
+  try {
+    const j = JSON.stringify(input)
+    return j === '{}' ? '' : j.slice(0, 160)
+  } catch {
+    return ''
+  }
+}
+
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))
+
+/* ---------- SSE ---------- */
+let cur = {}
+function connect() {
+  const es = new EventSource('/api/events')
+  es.onopen = () => { $('#dot').classList.add('on'); $('#conn').textContent = '已连接' }
+  es.onerror = () => { $('#dot').classList.remove('on'); $('#conn').textContent = '断开，重连中…' }
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data)
+    handle(ev)
+  }
+}
+
+const inflight = {}
+function handle(ev) {
+  const key = ev.runId
+  switch (ev.type) {
+    case 'run_start':
+      inflight[key] = log(`启动 (${ev.transport}${ev.cwd ? ' · ' + ev.cwd : ''})`, 'sys', ev.agentId)
+      break
+    case 'session':
+      log(`session ${ev.phase}: ${ev.sessionId}`, 'sys', ev.agentId)
+      break
+    case 'text': {
+      const buf = inflight[key + ':t'] || (inflight[key + ':t'] = log('', 'text', ev.agentId))
+      buf.textContent += ev.delta
+      break
+    }
+    case 'thinking': {
+      const buf = inflight[key + ':k'] || (inflight[key + ':k'] = log('', 'thinking', ev.agentId))
+      buf.textContent += ev.delta
+      break
+    }
+    case 'tool_call':
+      log(`⚙ ${ev.name} ${fmtToolInput(ev.input)}`, 'tool', ev.agentId)
+      break
+    case 'tool_result': {
+      // 工具结果是「成功/失败 + 输出」，不是错误；空输出也要有个明确说法，
+      // 否则只显示一个 ✓ 看不出到底做了什么。
+      const out = String(ev.output ?? '').trim()
+      const head = out ? out.slice(0, 220) : '（无输出）'
+      log(`✓ ${ev.name ? ev.name + ' ' : ''}${head}`, 'res', ev.agentId)
+      break
+    }
+    case 'permission':
+      log(`⚠ 需要授权: ${ev.id || ''}`, 'err', ev.agentId)
+      break
+    case 'log':
+      if (ev.level !== 'debug') log(ev.message, 'log', ev.agentId)
+      break
+    case 'done':
+      log(`完成 (${ev.stopReason || 'ok'})`, 'sys', ev.agentId)
+      break
+    case 'error':
+      log(`错误: ${ev.message}`, 'err', ev.agentId)
+      break
+  }
+}
+
+/* ---------- 交互 ---------- */
+document.querySelectorAll('.tab').forEach((t) => {
+  t.onclick = () => {
+    document.querySelectorAll('.tab').forEach((x) => x.classList.remove('active'))
+    t.classList.add('active')
+    mode = t.dataset.mode
+    if (mode === 'single' && selected.size > 1) { const f = [...selected][0]; selected.clear(); selected.add(f) }
+    renderAgents(); renderTargets()
+  }
+})
+$('#send').onclick = dispatch
+$('#prompt').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); dispatch() }
+})
+$('#clear').onclick = () => { logEl.innerHTML = ''; for (const k in inflight) delete inflight[k] }
+
+$('#reauth').onclick = async () => {
+  log('正在重新探测登录状态…', 'sys')
+  await loadAgents(true)
+  log('登录状态已刷新', 'sys')
+}
+loadAgents().then(() => {
+  // 默认勾选第一个「活着」的 agent：先 live 在线，再 ACP，最后任意已安装
+  const first =
+    agents.find((a) => a.installed && a.live?.up) ||
+    agents.find((a) => a.installed && a.transports.some((t) => t.kind === 'acp')) ||
+    agents.find((a) => a.installed)
+  if (first) { selected.add(first.id); renderAgents(); renderTargets() }
+})
+connect()
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "agent-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "统一指挥 Trae / Qoder / WorkBuddy / MiniMax / Doubao 的本地工作台",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "probe": "node tools/probe.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
