@@ -32,6 +32,11 @@
   .agent .cols .sep{color:#334155}
   .agent .qp{color:#38bdf8;font-size:10px;cursor:pointer;text-decoration:underline;margin-left:2px}
   .agent .qp:hover{color:#7dd3fc}
+  .agent .age{margin-left:auto;font-size:10px;white-space:nowrap;color:#7d8da6}
+  #reauth.busy{cursor:progress;opacity:.85}
+  .spin{display:inline-block;width:9px;height:9px;border:2px solid #475569;border-top-color:#e2e8f0;
+        border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px;margin-right:6px}
+  @keyframes spin{to{transform:rotate(360deg)}}
   .agent .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
   .tag{font-size:10px;padding:1px 6px;border-radius:999px;background:#0f172a;color:var(--dim);border:1px solid var(--line)}
   .tag.hot{color:var(--c);border-color:color-mix(in srgb,var(--c) 40%,transparent)}
@@ -70,6 +75,7 @@
   <h1>AGENT HUB</h1>
   <span class="hint" id="conn">连接中…</span>
   <button class="ghost" id="reauth" title="重新探测各家登录状态（trae 会解密 storage.json 查积分）">刷新登录状态</button>
+  <span class="hint" id="lastprobe" title="最近一次真实握手探测完成的时间">未探测</span>
   <div class="spacer"></div>
   <div class="tabs">
     <div class="tab active" data-mode="single">单发</div>
@@ -119,40 +125,107 @@ let mode = 'single'
 let activeTarget = null // 最近一次派发的取消句柄：{runId} | {batchId} | {groupId}
 
 /* ---------- 拉取 agent 列表 ---------- */
-async function loadAgents(fresh) {
+async function loadAgents(fresh, { awaitVerify = false } = {}) {
   const r = await fetch('/api/agents' + (fresh ? '?fresh=1' : '')).then((x) => x.json())
   agents = r.agents
   renderAgents()
   renderTargets()
   // 首屏只给本地层（快），真实握手在后台逐个补 —— 每张卡自己变绿
-  verifyAgents(agents.map((a) => a.id))
+  const p = verifyAgents(agents.map((a) => a.id), { fresh: !!fresh })
+  if (awaitVerify) await p
 }
 
 /* ---------- 真实握手验证（三级状态的后两档） ---------- */
 const verifying = new Set()
+const queued = new Set()
+const probeAt = new Map() // agentId -> 最近一次探测完成时间
+const probeFail = new Map() // agentId -> { at, reason }
 const escAttr = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 
+/** 秒级相对时间：12 秒前 / 3 分钟前 / 2 小时前 */
+function probeAge(ts) {
+  const s = Math.max(0, Math.round((Date.now() - Number(ts)) / 1000))
+  if (s < 60) return `${s} 秒前`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.round(m / 60)
+  return h < 48 ? `${h} 小时前` : `${Math.round(h / 24)} 天前`
+}
+
+/** 陈旧度颜色：1 分钟内正常，5 分钟内变灰，超过 5 分钟明显变暗 */
+function ageColor(ts) {
+  const s = (Date.now() - Number(ts)) / 1000
+  if (s < 60) return '#94a3b8'
+  if (s < 300) return '#64748b'
+  return '#3f4a5c'
+}
+
+function latestProbeAt() {
+  let ts = 0
+  for (const v of probeAt.values()) ts = Math.max(ts, v)
+  for (const a of agents) ts = Math.max(ts, Number(a.auth?.verifiedAt) || 0)
+  return ts
+}
+
+/** 按钮转圈 + 剩余数量；同时在顶栏显示最近一次探测时间 */
+function renderProbeButton() {
+  const btn = $('#reauth')
+  if (!btn) return
+  const n = verifying.size + queued.size
+  btn.disabled = n > 0
+  btn.classList.toggle('busy', n > 0)
+  btn.innerHTML = n > 0 ? `<span class="spin"></span>探测中 · 剩 ${n}` : '刷新登录状态'
+  const g = $('#lastprobe')
+  if (g) {
+    const ts = latestProbeAt()
+    g.textContent = ts ? `上次探测 ${probeAge(ts)}` : '未探测'
+    g.style.color = ts ? ageColor(ts) : '#7d8da6'
+    g.title = ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '还没有完成过真实握手探测'
+  }
+}
+
 async function verifyAgents(ids, { fresh = false, quota = false } = {}) {
-  const queue = [...ids]
+  // 同一个 agent 不重复入队：连点刷新只会补跑还没探测的，不会叠加请求
+  const queue = ids.filter((id) => !verifying.has(id) && !queued.has(id))
+  if (!queue.length) return
+  for (const id of queue) queued.add(id)
+  renderAgents()
+  renderProbeButton()
+
   const worker = async () => {
     while (queue.length) {
       const id = queue.shift()
+      queued.delete(id)
       verifying.add(id)
       renderAgents()
+      renderProbeButton()
+      const ac = new AbortController()
+      const timer = setTimeout(() => ac.abort(), 135_000)
       try {
         const q = `/api/verify?agent=${encodeURIComponent(id)}${fresh ? '&fresh=1' : ''}${quota ? '&quota=1' : ''}`
-        const r = await fetch(q).then((x) => x.json())
+        const res = await fetch(q, { signal: ac.signal })
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const r = await res.json()
         const next = r.agents?.[0]
-        if (next) {
-          const i = agents.findIndex((x) => x.id === id)
-          if (i >= 0) agents[i] = next
-        }
+        if (!next) throw new Error(r.error || '空响应')
+        const i = agents.findIndex((x) => x.id === id)
+        if (i >= 0) agents[i] = next
+        // 命中 5 分钟缓存时 verifiedAt 是旧时间 —— 必须如实显示年龄，
+        // 不能把「刚发了一次请求」当成「刚探测过」。
+        probeAt.set(id, Number(next.auth?.verifiedAt) || Date.now())
+        probeFail.delete(id)
       } catch (e) {
-        log(`验证 ${id} 失败：${e.message}`, 'err')
+        const reason = e.name === 'AbortError' ? '超时' : '失败'
+        probeAt.set(id, Date.now())
+        probeFail.set(id, { at: Date.now(), reason })
+        log(`验证 ${id} ${reason}：${e.message}`, 'err')
+      } finally {
+        clearTimeout(timer)
+        verifying.delete(id)
+        renderAgents()
+        renderTargets()
+        renderProbeButton()
       }
-      verifying.delete(id)
-      renderAgents()
-      renderTargets()
     }
   }
   // 并发 2：minimax/qoder 的探测各要 8~11s，起太多会把机器拖慢
@@ -238,11 +311,7 @@ function renderAgents() {
               : 'up'
     const rs = REACH_STYLE[reach]
     const via = viaOf(a)
-    const quota = verifying.has(a.id)
-      ? '探测中…'
-      : live?.loginPending
-        ? '等待浏览器登录'
-        : quotaOf(a)
+    const quota = live?.loginPending ? '等待浏览器登录' : quotaOf(a)
     // 没有精确余额的（7/8 家）给一个按需探针：发一条最小请求看返回码
     const probe = !verifying.has(a.id) && QUOTA_PROBES.has(a.id) && a.auth?.quota?.kind !== 'credits'
       ? `<span class="qp" data-id="${a.id}" title="发一条最小请求，区分 200 / 401 / 429 / 额度耗尽">探测额度</span>`
@@ -251,11 +320,39 @@ function renderAgents() {
     const stateTip = escAttr(
       `${a.label}：${rs.text}${dispatch.detail ? ` · ${dispatch.detail}` : ''} · 登录态${(LV_STYLE[lv] || LV_STYLE.none).name}${a.auth?.detail ? `（${a.auth.detail}）` : ''}${a.auth?.lastOkAt ? ` · 上次成功 ${agoText(a.auth.lastOkAt)}` : ''}`
     )
+
+    // 每行自己说清楚：正在探测 / 排队 / 超时 / 上次探测多久前
+    const ts = probeAt.get(a.id) || Number(a.auth?.verifiedAt) || 0
+    const fail = probeFail.get(a.id)
+    let ageText = '未探测'
+    let ageCol = '#7d8da6'
+    let ageState = 'age'
+    let ageTip = '还没有这次会话内的探测记录'
+    if (verifying.has(a.id)) {
+      ageText = '探测中…'
+      ageCol = '#38bdf8'
+      ageState = 'live'
+      ageTip = '正在发真实请求'
+    } else if (queued.has(a.id)) {
+      ageText = '排队中'
+      ageCol = '#7d8da6'
+      ageState = 'live'
+      ageTip = '等待前面的探测完成（并发 2）'
+    } else if (fail) {
+      ageText = `${fail.reason} · ${probeAge(fail.at)}`
+      ageCol = '#ef4444'
+      ageState = 'live'
+      ageTip = `最近一次探测${fail.reason}，时间 ${new Date(fail.at).toLocaleTimeString('zh-CN', { hour12: false })}`
+    } else if (ts) {
+      ageText = probeAge(ts)
+      ageCol = ageColor(ts)
+      ageTip = `上次探测 ${new Date(ts).toLocaleString('zh-CN', { hour12: false })}`
+    }
     return `
     <div class="agent ${selected.has(a.id) ? 'sel' : ''}" data-id="${a.id}" style="--c:${a.accent}">
       <div class="nm"><span class="sw" style="background:${dot};box-shadow:0 0 0 3px ${dot}22" title="${stateTip}"></span>${a.label}${
         a.installed ? '' : '<span style="margin-left:auto;color:#ef4444;font-size:10px">未安装</span>'
-      }</div>
+      }<span class="age" data-ts="${ts || ''}" data-state="${ageState}" title="${escAttr(ageTip)}" style="color:${ageCol}">${esc(ageText)}</span></div>
       <div class="vd cols">
         <span${loginCls}${reach === 'down' ? ` data-id="${a.id}"` : ''} title="${stateTip}" style="color:${rs.color}">${rs.text}${reach === 'down' ? '（点击登录）' : ''}</span>
         <span class="sep">·</span><span>通道 ${esc(via)}</span>
@@ -286,7 +383,6 @@ function renderAgents() {
         ;[6000, 15000, 40000, 90000].forEach((ms) =>
           setTimeout(async () => {
             await loadAgents(true)
-            verifyAgents([el.dataset.id], { fresh: true })
           }, ms)
         )
       }
@@ -566,9 +662,10 @@ $('#cancel').onclick = async () => {
 }
 
 $('#reauth').onclick = async () => {
+  // 探测期间按钮已 disabled；这里再兜一层，防止连点叠加请求
+  if (verifying.size || queued.size) return
   log('正在逐家做真实握手（qoder ~8s / minimax ~11s / workbuddy ~10s）…', 'sys')
-  await loadAgents(true)
-  await verifyAgents(agents.map((a) => a.id), { fresh: true })
+  await loadAgents(true, { awaitVerify: true })
   log('登录状态已刷新', 'sys')
 }
 loadAgents().then(() => {
@@ -580,6 +677,15 @@ loadAgents().then(() => {
   if (first) { selected.add(first.id); renderAgents(); renderTargets() }
 })
 connect()
+setInterval(() => {
+  document.querySelectorAll('.age[data-state="age"]').forEach((el) => {
+    const ts = Number(el.dataset.ts)
+    if (!ts) return
+    el.textContent = probeAge(ts)
+    el.style.color = ageColor(ts)
+  })
+  renderProbeButton()
+}, 5000)
 </script>
 </body>
 </html>

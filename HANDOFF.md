@@ -117,6 +117,8 @@ agent-hub/
     「最小请求 200」只是 `request`，不会升级成「额度充足」。`/api/agents` 走快路径，
     `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），`&quota=1` 额外探额度（目前 qoder）；
     `auth.lastOkAt` 落盘 `~/.agent-hub/verify.json`，额度未知时显示「上次成功 X 分钟前」。
+    每张卡还显示「上次探测 X 前」（缓存命中按服务端 `verifiedAt` 算，>5 分钟变暗），
+    刷新按钮探测期间转圈并禁用，逐行显示排队/探测中/超时；同 agent 不重复入队。
 12. **并行分发一律走 `/api/fanout`，不要并发打 `/api/run`**：前者会给每个 target 建
     `<cwd>/<agent>-<时间戳>/` 沙箱（复制源目录、跳过 node_modules/.git/dist），跑完自动出
     `fanout-<batchId>.report.json`（新增/修改/删除 + 两两差异）。并发打 `/api/run` 共用
