@@ -125,7 +125,7 @@ async function liveOf(a) {
  * 顺序很重要：先拿 live，再读运行时模型，最后用这些证据给登录态定级 ——
  * GUI 三家的「握手成功」判据就是「CDP 会话能读到模型目录」。
  */
-async function describeAgent(a, { fresh = false, verify = false } = {}) {
+async function describeAgent(a, { fresh = false, verify = false, quotaProbe = false } = {}) {
   const live = await liveOf(a)
   // 运行时模型清单可覆盖注册表兜底（alice / doubao 必须问客户端）
   let models = a.models
@@ -151,6 +151,7 @@ async function describeAgent(a, { fresh = false, verify = false } = {}) {
   const auth = await authStatus(a.id, {
     fresh,
     verify: verify || a.id === 'trae',
+    quotaProbe,
     live,
     modelsFetched,
   })
@@ -636,7 +637,7 @@ const server = http.createServer(async (req, res) => {
       const targets = id === 'all' ? list : list.filter((a) => a.id === id)
       if (!targets.length) return json(res, 404, { ok: false, error: `unknown agent: ${id}` })
       const out = await Promise.all(
-        targets.map((a) => describeAgent(a, { fresh: q.get('fresh') === '1', verify: true }))
+        targets.map((a) => describeAgent(a, { fresh: q.get('fresh') === '1', verify: true, quotaProbe: q.get('quota') === '1' }))
       )
       return json(res, 200, { ok: true, agents: out })
     }

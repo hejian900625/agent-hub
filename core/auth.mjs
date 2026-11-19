@@ -88,6 +88,69 @@ export const LEVEL_LABEL = {
 const VERIFY_TTL = 5 * 60_000
 const verifyCache = new Map() // agentId -> { at, checks }
 
+/** 握手通道的兜底文案：探测分支重写 handshake 时可能没带 via */
+const VIA_DEFAULT = {
+  trae: 'api.trae.cn 积分接口',
+  qoder: 'CLI --list-models',
+  workbuddy: 'CLI 最小 prompt (hi)',
+  minimax: 'CLI 最小 prompt (exec)',
+  loomy: 'ACP initialize',
+  doubao: 'CDP 9335 + 模型目录',
+  alice: 'CDP 9333 + 模型目录',
+  scnet: 'CDP 9336',
+}
+
+/**
+ * 上次握手成功的时间。额度拿不到时，界面至少能说「上次成功 3 分钟前」，
+ * 比干巴巴的「未知」有用；重启服务也保留（落在 ~/.agent-hub/verify.json）。
+ */
+const STATE_DIR = path.join(HOME, '.agent-hub')
+const STATE_FILE = path.join(STATE_DIR, 'verify.json')
+let lastOk = loadLastOk()
+
+function loadLastOk() {
+  try {
+    const o = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))
+    return o && typeof o === 'object' ? o : {}
+  } catch {
+    return {}
+  }
+}
+
+function markOk(agentId) {
+  if (!agentId) return
+  lastOk[agentId] = Date.now()
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true })
+    fs.writeFileSync(STATE_FILE, JSON.stringify(lastOk, null, 2))
+  } catch {
+    /* 落盘失败不影响探测 */
+  }
+}
+
+function ageText(ts) {
+  const n = Number(ts)
+  if (!Number.isFinite(n) || n <= 0) return '无成功记录'
+  const m = Math.max(0, Math.round((Date.now() - n) / 60_000))
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.round(m / 60)
+  return h < 48 ? `${h} 小时前` : `${Math.round(h / 24)} 天前`
+}
+
+/**
+ * 把失败文本归成三档，回答「是过期、被限流、还是额度耗尽」。
+ * 这是拿不到余额接口时的降级方案，不冒充精确额度。
+ */
+function classifyFailure(text) {
+  const s = String(text || '')
+  if (/401|403|unauthor|invalid token|token.{0,12}(expired|invalid)|please use \/login|未登录|登录已失效/i.test(s))
+    return { state: 'auth_expired', fatal: true, detail: '凭据失效（401/未登录）' }
+  if (/429|rate.?limit|too many requests|限流/i.test(s)) return { state: 'rate_limited', fatal: false, detail: '被限流（429）' }
+  if (/402|insufficient|quota|credit|balance|额度|余额|exhaust/i.test(s)) return { state: 'exhausted', fatal: false, detail: '额度不足/耗尽' }
+  return { state: 'error', fatal: false, detail: '请求失败' }
+}
+
 /** 异步子进程：带超时、收 stdout/stderr，不阻塞事件循环 */
 function runAsync(cmd, args, { timeout = 30_000, cwd, env, onSpawn } = {}) {
   return new Promise((resolve) => {
@@ -136,14 +199,18 @@ const short = (s, n = 120) => String(s || '').replace(/\s+/g, ' ').trim().slice(
 
 function lvlOf(checks) {
   if (checks.handshake?.fatal) return 'none'
-  if (checks.quota?.ok === true) return 'quota'
+  // 只有真正拿到额度数字（Trae 积分）才算 quota；
+  // 「最小请求 200」只证明此刻能用，不等于余额充足，仍停在 handshake。
+  if (checks.quota?.ok === true && checks.quota?.kind === 'credits') return 'quota'
   if (checks.handshake?.ok === true) return 'handshake'
   if (checks.config?.ok === true) return 'config'
   return 'none'
 }
 
-function grade(checks, { na = false } = {}) {
+function grade(checks, { na = false, agentId = null } = {}) {
   const level = na ? 'n/a' : lvlOf(checks)
+  const quota = checks.quota || { ok: null, kind: 'unknown', detail: '' }
+  const via = checks.handshake?.via || VIA_DEFAULT[agentId] || ''
   let detail
   if (level === 'n/a') detail = checks.config?.detail || '本地应用 · 无需 CLI 登录'
   else if (level === 'none') detail = checks.handshake?.detail || checks.config?.detail || '未检测到可用凭据'
@@ -151,17 +218,26 @@ function grade(checks, { na = false } = {}) {
   else if (level === 'handshake')
     detail =
       checks.handshake.detail +
-      (checks.quota?.ok === null
-        ? ' · 额度未验证'
-        : checks.quota?.ok === false
-          ? ` · 额度不足：${checks.quota.detail}`
-          : '')
-  else detail = checks.quota.detail
+      (quota.ok === null
+        ? ' · 额度未知'
+        : quota.ok === false
+          ? ` · ${quota.detail || '额度异常'}`
+          : ` · ${quota.detail || '最近请求 200 · 余额未暴露'}`)
+  else detail = quota.detail
+
+  const reach = na ? 'n/a' : level === 'none' ? 'down' : level === 'config' ? 'config' : 'up'
+  if (reach === 'up') markOk(agentId)
+  const at = lastOk[agentId] || null
   return {
     status: level === 'none' ? 'missing' : 'ok',
+    reach,
     level,
     label: LEVEL_LABEL[level],
     detail,
+    via,
+    quota: { ok: quota.ok ?? null, kind: quota.kind || 'unknown', source: quota.source || '', detail: quota.detail || '', checkedAt: quota.checkedAt || null },
+    lastOkAt: at,
+    lastOkAge: ageText(at),
     checks,
   }
 }
@@ -178,8 +254,8 @@ async function traeAuth(fresh) {
   if (!fresh && traeCache.result && Date.now() - traeCache.at < 60_000) return traeCache.result
   const checks = {
     config: { ok: false, detail: '' },
-    handshake: { ok: false, detail: '' },
-    quota: { ok: null, detail: '' },
+    handshake: { ok: false, detail: '', via: 'api.trae.cn 积分接口' },
+    quota: { ok: null, kind: 'unknown', source: 'api.trae.cn', detail: '' },
   }
   try {
     const info = readUserInfo()
@@ -189,7 +265,7 @@ async function traeAuth(fresh) {
         ? `storage.json · 用户 ${info.userId} · 有效期 ${String(info.expiredAt).slice(0, 10)}`
         : 'storage.json 里有登录项但没 token',
     }
-    if (!checks.config.ok) return finishTrae(grade(checks))
+    if (!checks.config.ok) return finishTrae(grade(checks, { agentId: 'trae' }))
 
     const t0 = Date.now()
     const st = await traeStatus()
@@ -198,7 +274,7 @@ async function traeAuth(fresh) {
     if (!st?.up) {
       // 401/过期 = 凭据存在但确实不可用
       checks.handshake = { ok: false, ms, fatal: true, detail: st?.reason || 'token 已失效' }
-      checks.quota = { ok: false, detail: '无可用额度（登录已失效）' }
+      checks.quota = { ok: false, kind: 'unknown', source: 'api.trae.cn', detail: '登录已失效，无法查询额度', checkedAt: Date.now() }
     } else if (st.credits == null && st.quotaError) {
       // 网络抖动 ≠ token 失效：停在 config 级，不冒充已验证
       checks.handshake = { ok: false, ms, detail: st.quotaError }
@@ -206,15 +282,15 @@ async function traeAuth(fresh) {
       checks.handshake = { ok: true, ms, detail: `api.trae.cn 200（${ms}ms）` }
       if (st.credits != null) {
         const used = st.consumed != null && st.total != null ? `，已用 ${st.consumed}/${st.total}` : ''
-        checks.quota = { ok: st.credits > 0, detail: `${st.credits} 积分${used}` }
+        checks.quota = { ok: st.credits > 0, kind: 'credits', source: 'api.trae.cn 积分接口', detail: `${st.credits} 积分${used}`, checkedAt: Date.now() }
       } else {
-        checks.quota = { ok: null, detail: '积分字段缺失' }
+        checks.quota = { ok: null, kind: 'unknown', source: 'api.trae.cn', detail: '积分字段缺失', checkedAt: Date.now() }
       }
     }
   } catch (e) {
     checks.config = { ok: false, detail: `本地凭据读取失败：${short(e.message)}` }
   }
-  return finishTrae(grade(checks))
+  return finishTrae(grade(checks, { agentId: 'trae' }))
 }
 
 function finishTrae(result) {
@@ -235,8 +311,8 @@ async function wbAuth(fresh) {
   let result
   const checks = {
     config: wbConfig(),
-    handshake: { ok: false, detail: '' },
-    quota: { ok: null, detail: '' },
+    handshake: { ok: false, detail: '', via: 'CLI 最小 prompt (hi)' },
+    quota: { ok: null, kind: 'unknown', source: 'CLI 最小 prompt', detail: '' },
   }
   try {
     const r = await runAsync(process.execPath, [WB_ENTRY, '-p', '--output-format', 'json', '--model', 'auto', 'hi'], {
@@ -246,19 +322,31 @@ async function wbAuth(fresh) {
     if (/Please use \/login/i.test(r.out)) {
       checks.handshake = { ok: false, ms: r.ms, fatal: true, detail: '未登录：点登录后浏览器扫码（走 SDK authenticate）' }
     } else if (/"subtype":"success"/.test(r.out) || /"subtype": "success"/.test(r.out)) {
+      const inTok = Number((r.out.match(/"input_tokens"\s*:\s*(\d+)/) || [])[1])
+      const outTok = Number((r.out.match(/"output_tokens"\s*:\s*(\d+)/) || [])[1])
+      const usage = Number.isFinite(inTok) && Number.isFinite(outTok) ? ` · in ${inTok} / out ${outTok} tokens` : ''
       checks.handshake = {
         ok: true,
         ms: r.ms,
         detail: `真实 prompt 成功 · ${WB_PRODUCT.includes('WorkBuddy') ? 'workbuddy.cn' : 'codebuddy.ai'} · ${r.ms}ms`,
       }
+      checks.quota = {
+        ok: true,
+        kind: 'request',
+        source: 'CLI 最小 prompt',
+        detail: `最小请求 200${usage} · 余额未暴露`,
+        checkedAt: Date.now(),
+      }
     } else {
       const err = (r.out.match(/"errors":\s*\[\s*"([^"]{0,160})/) || [])[1]
-      checks.handshake = { ok: false, ms: r.ms, detail: err ? `探测失败：${err}` : `探测失败（exit ${r.code}）` }
+      const why = classifyFailure(`${err || ''} ${r.out} ${r.err}`)
+      checks.handshake = { ok: false, ms: r.ms, fatal: why.fatal, detail: err ? `探测失败：${err}` : `探测失败（exit ${r.code}）` }
+      if (!why.fatal) checks.quota = { ok: false, kind: 'unknown', source: 'CLI 最小 prompt', detail: why.detail, checkedAt: Date.now() }
     }
   } catch (e) {
     checks.handshake = { ok: false, detail: `探测异常：${short(e.message)}` }
   }
-  result = grade(checks)
+  result = grade(checks, { agentId: 'workbuddy' })
   result.verifiedAt = Date.now()
   wbCache.at = Date.now()
   wbCache.result = result
@@ -305,16 +393,21 @@ function configCheck(agentId) {
 }
 
 /** Qoder：--list-models 是带身份的真实目录请求，顺便验证了账号与端点 */
-async function qoderChecks() {
-  const checks = {
-    config: configCheck('qoder'),
-    handshake: { ok: false, detail: '' },
-    quota: { ok: null, detail: '' },
-  }
-  if (!checks.config.ok) return checks
+function qoderSpawn() {
   const cli = getAgent('qoder').transports.cli
   const cmd = cli.nodeEntry && fs.existsSync(cli.nodeEntry) ? process.execPath : cli.cmd
   const args = (cli.nodeEntry && fs.existsSync(cli.nodeEntry) ? [cli.nodeEntry] : []).concat(['--list-models'])
+  return { cmd, args }
+}
+
+async function qoderChecks() {
+  const checks = {
+    config: configCheck('qoder'),
+    handshake: { ok: false, detail: '', via: 'CLI --list-models' },
+    quota: { ok: null, kind: 'unknown', source: '无余额接口', detail: '--list-models 不返回余额（可点「探测额度」发一次最小请求）' },
+  }
+  if (!checks.config.ok) return checks
+  const { cmd, args } = qoderSpawn()
   const r = await runAsync(cmd, args, { timeout: 40_000 })
   const models = r.out
     .split(/\r?\n/)
@@ -324,22 +417,41 @@ async function qoderChecks() {
     checks.handshake = { ok: true, ms: r.ms, detail: `--list-models 200 · ${models.length} 个模型 · ${r.ms}ms` }
   } else {
     const err = short(`${r.err} ${r.out}`, 160)
+    const why = classifyFailure(err)
     checks.handshake = {
       ok: false,
       ms: r.ms,
-      fatal: /not logged in|unauthorized|login|401|403|invalid token/i.test(err),
+      fatal: why.fatal,
       detail: err || `--list-models exit ${r.code}`,
     }
+    if (!why.fatal) checks.quota = { ok: false, kind: 'unknown', source: 'CLI --list-models', detail: why.detail, checkedAt: Date.now() }
   }
   return checks
+}
+
+/** 按需额度探针：发一条最小 prompt，用返回码区分 200 / 401 / 429 / 额度耗尽 */
+async function qoderQuotaProbe() {
+  try {
+    const { cmd, args } = qoderSpawn()
+    const r = await runAsync(cmd, args.slice(0, -1).concat(['-p', '--output-format', 'json', '只回复 ok 两个字符']), { timeout: 90_000 })
+    if (r.code === 0 && /"subtype"\s*:\s*"success"/.test(r.out)) {
+      const c = Number((r.out.match(/"total_credits"\s*:\s*([\d.]+)/) || [])[1])
+      const cost = Number.isFinite(c) ? ` · 本次消耗 ${c.toFixed(4)} 积分` : ''
+      return { ok: true, kind: 'request', source: 'CLI 最小 prompt', detail: `最小请求 200${cost} · 余额未暴露`, checkedAt: Date.now() }
+    }
+    const why = classifyFailure(`${r.err} ${r.out}`)
+    return { ok: false, kind: 'unknown', source: 'CLI 最小 prompt', detail: `${why.detail}（exit ${r.code}）`, checkedAt: Date.now() }
+  } catch (e) {
+    return { ok: false, kind: 'unknown', source: 'CLI 最小 prompt', detail: `探针异常：${short(e.message)}`, checkedAt: Date.now() }
+  }
 }
 
 /** MiniMax：provider test 对 OAuth 不支持，只能跑一句最小 prompt（约 11s） */
 async function minimaxChecks() {
   const checks = {
     config: configCheck('minimax'),
-    handshake: { ok: false, detail: '' },
-    quota: { ok: null, detail: '' },
+    handshake: { ok: false, detail: '', via: 'CLI 最小 prompt (exec)' },
+    quota: { ok: null, kind: 'unknown', source: 'CLI 最小 prompt', detail: '' },
   }
   if (!checks.config.ok) return checks
   const model = getAgent('minimax').defaultModel
@@ -354,14 +466,17 @@ async function minimaxChecks() {
   const body = (r.out || '').trim()
   if (r.code === 0 && body && !/Assertion failed|RemoveEnvironmentCleanupHook/.test(r.err + body)) {
     checks.handshake = { ok: true, ms: r.ms, detail: `最小 prompt 成功 · ${model} · ${r.ms}ms` }
+    checks.quota = { ok: true, kind: 'request', source: 'CLI 最小 prompt', detail: '最小请求 200 · 余额未暴露', checkedAt: Date.now() }
   } else {
     const err = short(`${r.err} ${r.out}`, 160)
+    const why = classifyFailure(err)
     checks.handshake = {
       ok: false,
       ms: r.ms,
-      fatal: /401|403|unauthorized|token|expired|login/i.test(err),
+      fatal: why.fatal,
       detail: err || `mcode exit ${r.code}`,
     }
+    if (!why.fatal) checks.quota = { ok: false, kind: 'unknown', source: 'CLI 最小 prompt', detail: why.detail, checkedAt: Date.now() }
   }
   return checks
 }
@@ -371,8 +486,8 @@ async function loomyChecks() {
   const acp = getAgent('loomy').transports.acp
   const checks = {
     config: { ok: fs.existsSync(acp.cmd), detail: acp.cmd },
-    handshake: { ok: false, detail: '' },
-    quota: { ok: null, detail: '' },
+    handshake: { ok: false, detail: '', via: 'ACP initialize' },
+    quota: { ok: null, kind: 'unknown', source: '无余额接口', detail: 'ACP 握手不含额度' },
   }
   if (!checks.config.ok) return checks
   const client = new AcpClient({ transport: acp, cwd: os.tmpdir(), label: 'loomy-verify' })
@@ -397,19 +512,19 @@ function guiChecks(agentId, { live, modelsFetched = 0 } = {}) {
   const agent = getAgent(agentId)
   const checks = {
     config: { ok: fs.existsSync(agent.bin), detail: agent.bin },
-    handshake: { ok: false, detail: '' },
-    quota: { ok: null, detail: '' },
+    handshake: { ok: false, detail: '', via: `CDP ${agent.transports.cdp?.port || ''}`.trim() },
+    quota: { ok: null, kind: 'unknown', source: '无余额接口', detail: '客户端不暴露额度' },
   }
   if (!checks.config.ok) return checks
   if (agentId === 'scnet') {
     // SCNet 没有可枚举的模型目录（固定 SCNet-Max），判据是「CDP 通 + 停在任务页」
     checks.handshake = live?.up && live?.running
-      ? { ok: true, detail: `CDP ${live.port} 会话可读 · ${agent.bin.includes('scnet') ? 'SCNet' : ''}` }
+      ? { ok: true, via: `CDP ${live.port}`, detail: `会话可读（CDP ${live.port}）· ${agent.bin.includes('scnet') ? 'SCNet' : ''}` }
       : { ok: false, detail: live?.up ? `CDP ${live.port} 已连，但页面不在任务页（可能停在登录页）` : 'CDP 调试端口未监听（客户端没开或没带 --remote-debugging-port）' }
     return checks
   }
   if (live?.up && modelsFetched > 0) {
-    checks.handshake = { ok: true, detail: `CDP 会话可读 · ${modelsFetched} 个模型` }
+    checks.handshake = { ok: true, via: `CDP ${live.port} + 模型目录`, detail: `CDP 会话可读 · ${modelsFetched} 个模型` }
   } else if (live?.up) {
     checks.handshake = { ok: false, detail: `CDP ${live.port} 已连，但读不到模型目录（可能停在登录页）` }
   } else {
@@ -431,16 +546,20 @@ const PROBES = {
 
 /**
  * @param {string} agentId
- * @param {{fresh?: boolean, verify?: boolean, live?: object, modelsFetched?: number}} opts
+ * @param {{fresh?: boolean, verify?: boolean, quotaProbe?: boolean, live?: object, modelsFetched?: number}} opts
  *   verify=false 只做本地检查（快）；verify=true 才发真实轻量请求（缓存 5 分钟）。
+ *   quotaProbe=true 额外发一条最小 prompt 探测额度档位（目前只有 qoder 需要，按需触发）。
  */
-export async function authStatus(agentId, { fresh = false, verify = false, live = null, modelsFetched = 0 } = {}) {
+export async function authStatus(agentId, { fresh = false, verify = false, quotaProbe = false, live = null, modelsFetched = 0 } = {}) {
   if (agentId === 'trae') return traeAuth(fresh)
   if (agentId === 'workbuddy' && !verify) {
     // 未要求验证时只读本地文件，不为一张卡片跑 10s 的 prompt
     const cached = wbCache.result
     if (cached && Date.now() - wbCache.at < 60_000) return cached
-    return grade({ config: wbConfig(), handshake: { ok: false, detail: '尚未握手（点「刷新登录状态」验证）' }, quota: { ok: null } })
+    return grade(
+      { config: wbConfig(), handshake: { ok: false, detail: '尚未握手（点「刷新登录状态」验证）' }, quota: { ok: null, kind: 'unknown' } },
+      { agentId }
+    )
   }
   if (agentId === 'workbuddy') return wbAuth(fresh)
 
@@ -450,20 +569,20 @@ export async function authStatus(agentId, { fresh = false, verify = false, live 
       {
         config: { ok: false, detail: LOCAL_APPS.has(agentId) ? '本地应用 · 无需 CLI 登录' : 'GUI 登录' },
         handshake: { ok: false, detail: '' },
-        quota: { ok: null },
+        quota: { ok: null, kind: 'unknown' },
       },
-      { na: true }
+      { na: true, agentId }
     )
   }
 
   const cached = verifyCache.get(agentId)
-  if (!fresh && cached && Date.now() - cached.at < VERIFY_TTL) {
+  if (!fresh && !quotaProbe && cached && Date.now() - cached.at < VERIFY_TTL) {
     const checks = cached.checks
     // GUI 三家的握手依赖实时 CDP 状态，缓存只保留「额度」这类不会瞬变的结论
     const out =
       ['doubao', 'alice', 'scnet'].includes(agentId)
-        ? grade({ ...checks, handshake: guiChecks(agentId, { live, modelsFetched }).handshake })
-        : grade(checks)
+        ? grade({ ...checks, handshake: guiChecks(agentId, { live, modelsFetched }).handshake }, { agentId })
+        : grade(checks, { agentId })
     out.verifiedAt = cached.at
     return out
   }
@@ -476,12 +595,16 @@ export async function authStatus(agentId, { fresh = false, verify = false, live 
         : agentId === 'loomy'
           ? { ok: fs.existsSync(getAgent('loomy').transports.acp.cmd), detail: getAgent('loomy').transports.acp.cmd }
           : guiChecks(agentId, { live, modelsFetched }).config
-    return grade({ config: local, handshake: { ok: false, detail: '尚未握手（点「刷新登录状态」验证）' }, quota: { ok: null } })
+    return grade(
+      { config: local, handshake: { ok: false, detail: '尚未握手（点「刷新登录状态」验证）' }, quota: { ok: null, kind: 'unknown' } },
+      { agentId }
+    )
   }
 
   const checks = await probe({ live, modelsFetched })
+  if (quotaProbe && agentId === 'qoder') checks.quota = await qoderQuotaProbe()
   verifyCache.set(agentId, { at: Date.now(), checks })
-  const out = grade(checks)
+  const out = grade(checks, { agentId })
   out.verifiedAt = Date.now()
   return out
 }
