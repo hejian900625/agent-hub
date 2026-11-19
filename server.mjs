@@ -26,6 +26,7 @@ import {
   writeReport,
   sandboxPrompt,
 } from './core/fanout.mjs'
+import { normalizeExpect, validateOutput, repairPrompt, describeExpect } from './core/contract.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const WEB = path.join(__dirname, 'web')
@@ -194,7 +195,17 @@ function fanoutGate(req) {
   return null
 }
 
-function executeRun({ agentId, prompt, cwd, transport, model, extraArgs = [], parentRunId = null, concurrent = false }) {
+function executeRun({
+  agentId,
+  prompt,
+  cwd,
+  transport,
+  model,
+  extraArgs = [],
+  parentRunId = null,
+  concurrent = false,
+  expect = null,
+}) {
   // 兜底：调用方没给模型时，强制落到这个 agent 自己的 defaultModel。
   // 不补的话 CLI 会用厂商内置默认（workbuddy 会去请求 openrouter/deepseek/... 然后 400）。
   if (!model) {
@@ -203,6 +214,7 @@ function executeRun({ agentId, prompt, cwd, transport, model, extraArgs = [], pa
   }
   const runId = nextRunId(agentId)
   const emit = makeEmitter(runId, agentId)
+  const contract = normalizeExpect(expect)
   const rec = {
     runId,
     agentId,
@@ -214,20 +226,53 @@ function executeRun({ agentId, prompt, cwd, transport, model, extraArgs = [], pa
     depth: parentRunId ? depthOf(parentRunId) + 1 : 0,
     startedAt: Date.now(),
     status: 'running',
+    expect: contract ? { type: contract.type, retry: contract.retry } : null,
   }
   runs.set(runId, rec)
 
   ;(async () => {
+    const attempts = contract ? 1 + contract.retry : 1
+    let lastErrors = []
     try {
-      const r = await runAgent(agentId, { prompt, cwd, transport, model, extraArgs, emit, concurrent })
-      rec.status = 'done'
-      // 有些轨（runCli / runTrae / runMinimax）是一次性把全文返回的，
-      // 期间 SSE 可能没吐过 text 增量（比如 codebuddy 的 result 帧），
-      // 这时要补发一次，否则 lastText 空、下游编排拿不到上游输出。
-      if (r?.text && !rec.lastText) {
-        rec.lastText = r.text
-        emit.text(r.text)
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        rec.attempt = attempt
+        // 每次重试都要清空累积文本，否则下游会拿到「失败答案 + 修复答案」的拼接
+        rec.lastText = ''
+        const ask = attempt === 1 ? prompt : repairPrompt(prompt, contract, lastErrors)
+        if (attempt > 1) emit.log(`输出契约未通过，带错误信息重试（第 ${attempt}/${attempts} 次）`, 'warn')
+
+        // files 契约没声明具体文件时，需要在跑之前拍一张快照
+        let before = null
+        if (contract?.type === 'files' && !contract.files?.length && !contract.pattern) before = snapshot(cwd || process.cwd())
+
+        const r = await runAgent(agentId, { prompt: ask, cwd, transport, model, extraArgs, emit, concurrent })
+        // 有些轨（runCli / runTrae / runMinimax）是一次性把全文返回的，
+        // 期间 SSE 可能没吐过 text 增量（比如 codebuddy 的 result 帧），
+        // 这时要补发一次，否则 lastText 空、下游编排拿不到上游输出。
+        if (r?.text && !rec.lastText) {
+          rec.lastText = r.text
+          emit.text(r.text)
+        }
+
+        if (!contract) break
+        const v = validateOutput(contract, rec.lastText, { cwd: cwd || process.cwd(), before })
+        rec.contract = {
+          type: contract.type,
+          attempt,
+          ok: v.ok,
+          errors: v.errors,
+        }
+        if (v.ok) {
+          // 用规范化后的内容（去掉围栏 / 压缩 JSON）喂下游，而不是原始回复
+          rec.lastText = v.normalized
+          if (attempt > 1) emit.log(`第 ${attempt} 次重试通过契约校验`, 'debug')
+          break
+        }
+        lastErrors = v.errors
+        emit.log(`输出契约校验失败：${v.errors.join('；')}`, 'warn')
+        if (attempt === attempts) throw new Error(`输出契约校验失败：${v.errors.join('；')}`)
       }
+      rec.status = 'done'
     } catch (e) {
       rec.status = 'error'
       rec.error = e.message
@@ -314,6 +359,7 @@ async function orchestrate({ plan, cwd }) {
 
   const done = new Map() // index -> runId
   const results = []
+  const skipped = []
 
   const waitAll = (idxs) =>
     Promise.all(
@@ -340,7 +386,25 @@ async function orchestrate({ plan, cwd }) {
     await Promise.all(
       ready.map(async (i) => {
         const deps = plan[i].after || []
-        if (deps.length) await waitAll(deps)
+        if (deps.length) {
+          await waitAll(deps)
+          // 上游契约失败 / 报错时，别把空文本或脏文本喂下去，直接跳过这一棒
+          const bad = deps
+            .map((j) => ({ j, r: runs.get(done.get(j)) }))
+            .filter((x) => !x.r || x.r.status !== 'done')
+          if (bad.length) {
+            const why = bad[0].r?.error || '上游未完成'
+            skipped.push({
+              index: i,
+              agent: plan[i].agent,
+              reason: `上游第 ${bad[0].j + 1} 步（${plan[bad[0].j].agent}）失败：${why}`,
+            })
+            // 用 null 占位，让更下游知道「这一棒被跳过」，而不是永远等不到依赖
+            done.set(i, null)
+            remaining.delete(i)
+            return
+          }
+        }
         // 依赖结果注入 prompt
         let prompt = plan[i].prompt
         if (assign) {
@@ -373,6 +437,11 @@ async function orchestrate({ plan, cwd }) {
           transport: plan[i].transport,
           model: plan[i].model,
           extraArgs: plan[i].extraArgs,
+          // 链式流水默认要求「非空文本」；每一步可以显式声明 expect，false 表示不校验
+          expect:
+            plan[i].expect === false
+              ? null
+              : plan[i].expect || (plan.length > 1 ? { type: 'text', minLength: 1, retry: 1 } : null),
           // 同批并发跑的多个 agent 若都往同一个文件写，必须排队，否则后写者会盖掉先写者。
           concurrent: ready.length > 1,
         })
@@ -382,7 +451,12 @@ async function orchestrate({ plan, cwd }) {
     )
   }
 
-  return { runIds: [...done.entries()].map(([i, runId]) => ({ index: i, agent: plan[i].agent, runId })) }
+  return {
+    runIds: [...done.entries()]
+      .filter(([, runId]) => !!runId)
+      .map(([i, runId]) => ({ index: i, agent: plan[i].agent, runId })),
+    skipped,
+  }
 }
 
 /* ---------------------- 并行分发：沙箱隔离 ---------------------- */

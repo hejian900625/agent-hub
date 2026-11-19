@@ -116,6 +116,11 @@ agent-hub/
     `<cwd>/<agent>-<时间戳>/` 沙箱（复制源目录、跳过 node_modules/.git/dist），跑完自动出
     `fanout-<batchId>.report.json`（新增/修改/删除 + 两两差异）。并发打 `/api/run` 共用
     一个 cwd 会互相覆盖同名文件。`/api/run` 的 `concurrent` 只负责同名文件的串行锁，不隔离目录。
+13. **链式每一步都有输出契约**（`core/contract.mjs`）：`expect.type` = text/json/code/files/regex，
+    校验失败带错误信息重试 `retry` 次（默认 1），仍失败则该步 error、下游直接跳过。
+    喂给下游的是**规范化后**的内容（去围栏 / 压平 JSON），不是 agent 原始回复。
+    契约和任务本身矛盾时（比如要求「不要代码块」又给了 code 契约）重试也不会过 —— 这是特性，
+    失败要显式暴露，别让脏数据往下流。
 
 ---
 
@@ -136,6 +141,7 @@ agent-hub/
 - 「已登录」绿灯名不副实（只 stat 了 credential 文件）→ 三级状态 + 真实握手探测，
   token 过期/积分归零不再显示成绿色
 - 并行分发同名文件互相覆盖 → `/api/fanout` 每 target 独立沙箱 + 跑完 diff 报告
+- 链式流水把上一步的原始回复直接喂下游 → 每步 `expect` 契约 + 校验 + 带错重试 + 跳过后继
 
 ---
 

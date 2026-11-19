@@ -101,6 +101,28 @@ curl -s localhost:7788/api/fanout -H 'content-type: application/json' -d '{
 注意：cwd 只能约束相对路径。若 prompt 写死绝对路径且 agent 不听话，仍可能写到外面——
 沙箱是降低概率 + 让结果可比，不是安全边界。
 
+### 4.2 链式流水的输出契约
+
+链条原来只定义「谁接谁」，第一步回一段带围栏的解释文字时，这段脏文本会被原样塞进第二步。
+现在每一步可以声明 `expect`，校验不过就带着错误重跑该步，仍不过则整步失败、下游不启动：
+
+```json
+{"agent":"qoder","prompt":"给出重构方案","expect":{"type":"json","retry":1,
+  "schema":{"type":"object","required":["steps"],"properties":{"steps":{"type":"array","minItems":1}}}}}
+```
+
+| type | 校验 | 喂给下游的内容 |
+|---|---|---|
+| `text`（链式默认） | 非空；可选 `minLength/maxLength/contains/regex` | trim 后的正文 |
+| `json` | 从 ```json 围栏或纯文本解析；支持 JSON Schema 子集 | `JSON.stringify(value, null, 2)` |
+| `code` | 必须找到围栏；`language` 指定语言（不回退到别的语言） | 围栏内代码（去掉围栏） |
+| `files` | 声明 `files:[...]` / `pattern` / 或对比跑前快照新增 | 正文 + `[产出文件]` 清单 |
+| `regex` | 全文匹配 | 原样 |
+
+`retry` 默认 1（最多跑 2 次）。重试 prompt 会附上「校验失败原因 + 本次必须满足的格式」。
+第一步失败时，后续步骤直接跳过（返回 `skipped`），不会拿空文本或脏文本继续跑。
+UI 的「链式流水」标签下有一个「输出契约」下拉，整条链统一生效；`expect:false` 可关闭。
+
 ## 5. 统一事件模型
 
 所有 adapter 输出都归一成同一种事件（`core/bus.mjs`）：

@@ -82,6 +82,13 @@
       <div class="bar">
         <span class="hint">工作目录</span>
         <input type="text" id="cwd" style="flex:1;max-width:520px" placeholder="C:\\path\\to\\project">
+        <span class="hint" id="contractlab" style="display:none;margin-left:12px">输出契约</span>
+        <select id="contract" style="display:none;min-width:170px" title="每一步必须输出的格式；校验失败会带错误重试该步">
+          <option value="text">文本（非空）</option>
+          <option value="json">JSON</option>
+          <option value="code">代码（围栏内）</option>
+          <option value="files">产出文件</option>
+        </select>
       </div>
       <div class="bar" id="modelbar" style="display:none">
         <!-- 每个选中的 agent 一行模型下拉：并行/链式时各自选各自的，不再只认第一个 -->
@@ -324,9 +331,25 @@ async function dispatch() {
     else log('只有 1 个目标，未启用沙箱隔离', 'sys')
   } else {
     // after 用「id 下标」；plan 数组里多带一个 model 字段给日志用，发出去前再剥掉
-    const plan = ids.map((agent, i) => ({ agent, prompt, cwd, model: modelFor(agent), after: i ? [i - 1] : [] }))
-    log(`→ 链式流水：${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' → ')}`, 'sys')
+    const ctype = $('#contract').value
+    const expect =
+      ctype === 'text' ? { type: 'text', minLength: 1, retry: 1 }
+      : ctype === 'code' ? { type: 'code', requireFence: true, retry: 1 }
+      : { type: ctype, retry: 1 }
+    const plan = ids.map((agent, i) => ({
+      agent,
+      prompt,
+      cwd,
+      model: modelFor(agent),
+      expect,
+      after: i ? [i - 1] : [],
+    }))
+    const cname = $('#contract').selectedOptions[0]?.textContent || ctype
+    log(`→ 链式流水：${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' → ')} · 每步输出契约：${cname}`, 'sys')
     const out = await post('/api/orchestrate', { plan, cwd })
+    if (out.skipped?.length) {
+      for (const s of out.skipped) log(`跳过第 ${s.index + 1} 步 ${label(s.agent)}：${s.reason}`, 'err', s.agent)
+    }
   }
 }
 const post = (u, b) => fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json())
@@ -457,6 +480,9 @@ document.querySelectorAll('.tab').forEach((t) => {
     t.classList.add('active')
     mode = t.dataset.mode
     if (mode === 'single' && selected.size > 1) { const f = [...selected][0]; selected.clear(); selected.add(f) }
+    const chainOnly = mode === 'chain' ? '' : 'none'
+    $('#contract').style.display = chainOnly
+    $('#contractlab').style.display = chainOnly
     renderAgents(); renderTargets()
   }
 })
