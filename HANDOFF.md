@@ -111,9 +111,12 @@ agent-hub/
 11. **登录态是三级，不是布尔**：`level` = `none < config < handshake < quota`。
     只看凭据文件只能到 `config`，界面必须写「仅凭据·未验证」；真握手（qoder `--list-models`、
     minimax 最小 prompt、workbuddy 一句 hi、trae 积分接口、loomy ACP initialize、GUI 读模型目录）
-    成功才到 `handshake`；只有 Trae 能判到 `quota`。卡片状态拆成固定三列（可达性 / 通道 / 额度），
-    **第一列看 `dispatch.ok` 而不是 `auth.level`**：Trae 的积分接口能通不代表客户端在跑，
-    CDP 9334 不在时显示 `未启动`，不能显示绿色 `可达`。`auth.via` 说明握手走哪条路，
+    成功才到 `handshake`；只有 Trae 能判到 `quota`。一个 agent 有多条链路（额度 / 会话 / 模型），
+    可达性可以不同，所以卡片拆成「主状态 + 三个能力徽标 + 通道说明」，接口字段是 `capabilities`。
+    **主状态只看能不能建会话（`capabilities.session.ok`），不是 `auth.level`，也不是额度**：
+    Trae 的积分接口能通不代表客户端在跑，CDP 9334 不在时显示 `部分可用` + `会话 不可达` +
+    `CDP 9334 未监听`，不能显示绿色 `可派发`。CLI 类尚未握手时 `session.ok = null`（未验证），
+    主状态落 `仅配置`，别把「还没问」写成「不可达」。`auth.via` 说明握手走哪条路，
     `auth.quota.kind` = `credits | request | unknown`——
     「最小请求 200」只是 `request`，不会升级成「额度充足」。`/api/agents` 走快路径，
     `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），`&quota=1` 额外探额度（目前 qoder）；
@@ -159,8 +162,8 @@ agent-hub/
 - 并行分发同名文件互相覆盖 → `/api/fanout` 每 target 独立沙箱 + 跑完 diff 报告
 - 链式流水把上一步的原始回复直接喂下游 → 每步 `expect` 契约 + 校验 + 带错重试 + 跳过后继
 - 链式跑到一半发现方向错了只能干等 → AbortController 贯穿全链，级联取消在途 adapter + 跳过未派发步骤
-- 状态串把「握手」和「端口」并列成两件事（SCNet 的握手本来就是 CDP）→ 固定三列：可达性 / 通道 / 额度，
-  `auth.via` 写明握手走的哪条通道
+- 一个状态词概括所有链路必然失真（额度能查 ≠ 会话能建）→ 主状态只看会话，另给额度 / 会话 / 模型
+  三个能力徽标，`auth.via` 与 `capabilities.channel` 写明实际通道
 - 7/8 家额度未知 → `quota.kind` 三态（credits/request/unknown）+ qoder 按需最小请求探针 +
   `lastOkAt` 落盘，界面给「上次成功 X 分钟前」
 - 任务花了多少钱看不到 → 每个 run 结束写一行 `~/.agent-hub/ledger.jsonl`（token / cost / credits），
