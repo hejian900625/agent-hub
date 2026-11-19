@@ -33,11 +33,26 @@ const WEB = path.join(__dirname, 'web')
 const PORT = Number(process.env.PORT || 7788)
 let ACTUAL_PORT = PORT
 
+/**
+ * 本地工作台是长驻进程：任何一处未捕获的 rejection 都不该把整个服务带走
+ * （取消/杀子进程时最容易冒出来）。记日志，继续服务。
+ */
+process.on('unhandledRejection', (e) => {
+  console.error('[unhandledRejection]', e?.stack || e)
+})
+process.on('uncaughtException', (e) => {
+  console.error('[uncaughtException]', e?.stack || e)
+})
+
 /** 运行中的任务表 */
 const runs = new Map() // runId -> {runId, agentId, prompt, cwd, startedAt, status, abort}
 
 /** 并行分发批次（沙箱 + 对比报告） */
 const fanoutBatches = new Map() // batchId -> batch
+
+/** 取消句柄：单个 run / 整条链（group）/ 整个 fanout 批次 */
+const runAborts = new Map() // runId -> AbortController
+const groups = new Map() // groupId -> { id, abort, createdAt }
 
 /* ----------------------------- SSE ----------------------------- */
 
@@ -205,6 +220,8 @@ function executeRun({
   parentRunId = null,
   concurrent = false,
   expect = null,
+  signal: outerSignal = null,
+  groupId = null,
 }) {
   // 兜底：调用方没给模型时，强制落到这个 agent 自己的 defaultModel。
   // 不补的话 CLI 会用厂商内置默认（workbuddy 会去请求 openrouter/deepseek/... 然后 400）。
@@ -215,6 +232,13 @@ function executeRun({
   const runId = nextRunId(agentId)
   const emit = makeEmitter(runId, agentId)
   const contract = normalizeExpect(expect)
+  // 每个 run 自己的取消句柄；外部（链/批次）取消时级联进来
+  const ac = new AbortController()
+  runAborts.set(runId, ac)
+  if (outerSignal) {
+    if (outerSignal.aborted) ac.abort('upstream')
+    else outerSignal.addEventListener('abort', () => ac.abort('upstream'), { once: true })
+  }
   const rec = {
     runId,
     agentId,
@@ -227,6 +251,8 @@ function executeRun({
     startedAt: Date.now(),
     status: 'running',
     expect: contract ? { type: contract.type, retry: contract.retry } : null,
+    groupId,
+    cancellable: true,
   }
   runs.set(runId, rec)
 
@@ -245,7 +271,17 @@ function executeRun({
         let before = null
         if (contract?.type === 'files' && !contract.files?.length && !contract.pattern) before = snapshot(cwd || process.cwd())
 
-        const r = await runAgent(agentId, { prompt: ask, cwd, transport, model, extraArgs, emit, concurrent })
+        const r = await runAgent(agentId, {
+          prompt: ask,
+          cwd,
+          transport,
+          model,
+          extraArgs,
+          emit,
+          concurrent,
+          signal: ac.signal,
+        })
+        if (ac.signal.aborted || r?.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' })
         // 有些轨（runCli / runTrae / runMinimax）是一次性把全文返回的，
         // 期间 SSE 可能没吐过 text 增量（比如 codebuddy 的 result 帧），
         // 这时要补发一次，否则 lastText 空、下游编排拿不到上游输出。
@@ -274,11 +310,17 @@ function executeRun({
       }
       rec.status = 'done'
     } catch (e) {
-      rec.status = 'error'
-      rec.error = e.message
-      emit.error(e.message)
+      if (e?.name === 'AbortError' || ac.signal.aborted) {
+        rec.status = 'cancelled'
+        rec.reason = '用户取消'
+      } else {
+        rec.status = 'error'
+        rec.error = e.message
+        emit.error(e.message)
+      }
     } finally {
       rec.endedAt = Date.now()
+      runAborts.delete(runId)
       // 延迟清理，留给前端拉取
       setTimeout(() => runs.delete(runId), 10 * 60 * 1000)
     }
@@ -340,7 +382,7 @@ function assignPrompt(original, index, total, step, agents) {
  * plan: [{ agent, prompt, cwd?, transport?, after?: number[] }]
  * after 指向 plan 中下标；无 after = 立即并行启动。
  */
-async function orchestrate({ plan, cwd }) {
+async function orchestrate({ plan, cwd, group = null }) {
   if (!Array.isArray(plan) || plan.length === 0) throw new Error('plan must be a non-empty array')
   plan.forEach((s, i) => {
     const a = getAgent(s.agent)
@@ -386,6 +428,12 @@ async function orchestrate({ plan, cwd }) {
     await Promise.all(
       ready.map(async (i) => {
         const deps = plan[i].after || []
+        if (group?.abort.signal.aborted) {
+          skipped.push({ index: i, agent: plan[i].agent, reason: '整条链已取消' })
+          done.set(i, null)
+          remaining.delete(i)
+          return
+        }
         if (deps.length) {
           await waitAll(deps)
           // 上游契约失败 / 报错时，别把空文本或脏文本喂下去，直接跳过这一棒
@@ -393,7 +441,10 @@ async function orchestrate({ plan, cwd }) {
             .map((j) => ({ j, r: runs.get(done.get(j)) }))
             .filter((x) => !x.r || x.r.status !== 'done')
           if (bad.length) {
-            const why = bad[0].r?.error || '上游未完成'
+            const why =
+              bad[0].r?.status === 'cancelled'
+                ? '上游已取消'
+                : bad[0].r?.error || '上游未完成'
             skipped.push({
               index: i,
               agent: plan[i].agent,
@@ -442,6 +493,8 @@ async function orchestrate({ plan, cwd }) {
             plan[i].expect === false
               ? null
               : plan[i].expect || (plan.length > 1 ? { type: 'text', minLength: 1, retry: 1 } : null),
+          signal: group?.abort.signal || null,
+          groupId: group?.id || null,
           // 同批并发跑的多个 agent 若都往同一个文件写，必须排队，否则后写者会盖掉先写者。
           concurrent: ready.length > 1,
         })
@@ -478,6 +531,7 @@ function startFanout({ agents, prompt, cwd, isolate = true }) {
     runIds: [],
     snapshots: {},
     baseline: null,
+    abort: new AbortController(),
   }
 
   if (isolated) {
@@ -505,6 +559,8 @@ function startFanout({ agents, prompt, cwd, isolate = true }) {
       transport: s.transport,
       model: s.model || agent.defaultModel,
       extraArgs: s.extraArgs,
+      signal: batch.abort.signal,
+      groupId: batch.id,
       concurrent: agents.length > 1,
     })
     batch.members.push({ agent: s.agent, dir })
@@ -522,6 +578,7 @@ function watchBatch(batch) {
   const t0 = Date.now()
   const tick = () => {
     const pending = batch.runIds.some((id) => runs.get(id)?.status === 'running')
+    if (!pending && batch.abort) batch.abort = null // 跑完了就别再留着句柄
     if (pending && Date.now() - t0 < 20 * 60 * 1000) return setTimeout(tick, 800)
     try {
       batch.report = buildReport(batch)
@@ -677,6 +734,7 @@ const server = http.createServer(async (req, res) => {
           isolated: b.isolated,
           createdAt: b.createdAt,
           ready: !!b.ready,
+          cancelled: !!b.cancelled,
           summary: b.report?.summary,
         })),
       })
@@ -691,6 +749,7 @@ const server = http.createServer(async (req, res) => {
         isolated: b.isolated,
         baseDir: b.baseDir,
         ready: !!b.ready,
+        cancelled: !!b.cancelled,
         error: b.error || null,
         reportFile: b.reportFile || null,
         runs: b.runIds.map((runId, i) => {
@@ -708,16 +767,58 @@ const server = http.createServer(async (req, res) => {
       const plan = Array.isArray(b.plan) ? b.plan : []
       const wanted = new Set(plan.map((s) => s.agent))
       const sentinel = new Set(wanted)
+      // 整条链共用一个 group：一次 abort 级联取消在途步骤，未派发的直接跳过
+      const groupId = nextRunId('chain')
+      const group = { id: groupId, createdAt: Date.now(), abort: new AbortController() }
+      groups.set(groupId, group)
+      setTimeout(() => groups.delete(groupId), 60 * 60 * 1000)
       const out = await Promise.race([
-        orchestrate({ plan, cwd: b.cwd }),
+        orchestrate({ plan, cwd: b.cwd, group }),
         new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
       ])
-      if (out) return json(res, 200, out)
+      if (out) return json(res, 200, { ...out, groupId })
       return json(res, 200, {
         accepted: true,
+        groupId,
         note: '流水线较长，首批派发已发出；用 /api/runs 或 SSE 观察后续进度',
         agents: [...sentinel],
       })
+    }
+
+    // 全局取消：runId / groupId / batchId / all 任选其一
+    if (url.pathname === '/api/cancel' && req.method === 'POST') {
+      const b = await body(req)
+      const cancelled = []
+      if (b.runId) {
+        const ac = runAborts.get(b.runId)
+        if (ac) {
+          ac.abort('user')
+          cancelled.push({ runId: b.runId })
+        }
+      }
+      if (b.groupId) {
+        const g = groups.get(b.groupId)
+        if (g) {
+          g.abort.abort('user')
+          cancelled.push({ groupId: b.groupId })
+        }
+      }
+      if (b.batchId) {
+        const bt = fanoutBatches.get(b.batchId)
+        if (bt?.abort) {
+          bt.abort.abort('user')
+          bt.cancelled = true
+          cancelled.push({ batchId: b.batchId })
+        }
+      }
+      if (b.all) {
+        const n = runAborts.size
+        for (const ac of runAborts.values()) ac.abort('user')
+        for (const g of groups.values()) g.abort.abort('user')
+        for (const bt of fanoutBatches.values()) bt.abort?.abort('user')
+        cancelled.push({ all: true, runs: n })
+      }
+      return json(res, 200, { ok: true, cancelled })
     }
 
     if (url.pathname === '/api/runs' && req.method === 'GET') {

@@ -199,7 +199,7 @@ function subscribe(base, emit, ac, stats) {
   return () => ac.abort()
 }
 
-export async function runLoomy(agentId, { prompt, cwd, emit, sessionId, agent = 'loomy-file', model }) {
+export async function runLoomy(agentId, { prompt, cwd, emit, sessionId, agent = 'loomy-file', model, signal }) {
   const base = await resolveBase()
   emit.start({ transport: 'http', base, cwd })
   emit.log(`opencode 服务 ${base}`, 'debug')
@@ -215,12 +215,18 @@ export async function runLoomy(agentId, { prompt, cwd, emit, sessionId, agent = 
   const stats = { text: 0 }
   const stop = subscribe(base, emit, ac, stats)
 
+  // 外部取消 → 同时掐断 SSE 和 POST /message
+  const onAbort = () => ac.abort()
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener('abort', onAbort, { once: true })
+
   const started = Date.now()
   let res
   try {
     const r = await fetch(`${base}/session/${sid}/message`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      signal: signal ? AbortSignal.any([ac.signal, signal]) : ac.signal,
       body: JSON.stringify({
         agent,
         parts: [{ type: 'text', text: prompt }],
@@ -230,12 +236,24 @@ export async function runLoomy(agentId, { prompt, cwd, emit, sessionId, agent = 
     })
     if (!r.ok) throw new Error(`POST message ${r.status}: ${(await r.text()).slice(0, 400)}`)
     res = await r.json()
+  } catch (e) {
+    if (signal?.aborted || e?.name === 'AbortError') {
+      emit.cancelled('用户取消')
+      throw Object.assign(new Error('cancelled'), { name: 'AbortError' })
+    }
+    throw e
   } finally {
     // SSE 的 part.delta 是流式推送的，POST 返回时可能还在路上。
     // 先等一小会儿让最后的增量落地，再判断「SSE 到底吐没吐过」，
     // 否则 stats.text 还是 0 就会把全文再补发一遍 → 界面出现「在线在线」。
     await new Promise((r) => setTimeout(r, 800))
     stop()
+    signal?.removeEventListener('abort', onAbort)
+  }
+
+  if (signal?.aborted) {
+    emit.cancelled('用户取消')
+    throw Object.assign(new Error('cancelled'), { name: 'AbortError' })
   }
 
   // 同步返回里已有完整文本：拼起来（SSE 已吐过的部分前端会去重，这里只给收尾全文）

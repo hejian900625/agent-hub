@@ -17,7 +17,7 @@ export function nextRunId(prefix = 'run') {
  * 统一事件模型（所有 adapter 的输出都必须落成这个形状）
  *
  *  type: run_start | session | text | thinking | tool_call | tool_result |
- *        file_edit | permission | usage | log | done | error
+ *        file_edit | permission | usage | log | done | cancelled | error
  */
 export function makeEmitter(runId, agentId) {
   const emit = (ev) => {
@@ -39,6 +39,7 @@ export function makeEmitter(runId, agentId) {
     usage: (tokens) => emit({ type: 'usage', tokens }),
     log: (message, level = 'info') => emit({ type: 'log', level, message }),
     done: (result = {}) => emit({ type: 'done', ok: true, ...result }),
+    cancelled: (reason = '用户取消', extra = {}) => emit({ type: 'cancelled', reason, ...extra }),
     error: (message, extra = {}) => emit({ type: 'error', ok: false, message, ...extra }),
   }
 }

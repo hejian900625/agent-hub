@@ -325,6 +325,10 @@ export async function runScnet(agentId, opts = {}) {
 
     while (Date.now() - t0 < timeoutMs) {
       await sleep(1200)
+      if (opts.signal?.aborted) {
+        opts.emit?.cancelled?.('用户取消')
+        return { ok: false, aborted: true, text: sentText || lastBody, transport: 'cdp' }
+      }
       const s = await readState(cdp)
       if (s.nResp > before.nResp) started = true
       if (!started) continue

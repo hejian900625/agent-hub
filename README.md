@@ -63,6 +63,7 @@ mcode login                     # MiniMax（Node 24 有坑，见 §6）
 | POST | `/api/fanout` | **并行分发（推荐）**：`{agents:[{agent,model?}], prompt, cwd?, isolate?}` → 每家一个沙箱子目录，跑完自动出 diff |
 | GET | `/api/fanout` / `/api/fanout/<batchId>` | 批次列表 / 单批进度 + 对比报告 |
 | POST | `/api/orchestrate` | `{plan:[{agent,prompt,model?,after?:[]}], cwd?}` |
+| POST | `/api/cancel` | `{runId}` / `{groupId}` / `{batchId}` / `{all:true}` → 级联取消在途任务 |
 | GET | `/api/runs` | 运行中/近期任务 |
 | POST | `/api/login` | `{agent}` 调起该 agent 的登录流程 |
 
@@ -122,6 +123,21 @@ curl -s localhost:7788/api/fanout -H 'content-type: application/json' -d '{
 `retry` 默认 1（最多跑 2 次）。重试 prompt 会附上「校验失败原因 + 本次必须满足的格式」。
 第一步失败时，后续步骤直接跳过（返回 `skipped`），不会拿空文本或脏文本继续跑。
 UI 的「链式流水」标签下有一个「输出契约」下拉，整条链统一生效；`expect:false` 可关闭。
+
+### 4.3 全局取消
+
+取消信号用 `AbortController` 贯穿全链：`/api/run` 的每个 run、`/api/orchestrate` 的整条链
+（返回 `groupId`）、`/api/fanout` 的整批（`batchId`）各有一个句柄，外部取消会级联到所有在途 adapter：
+
+| 轨 | 取消动作 |
+|---|---|
+| ACP | 先发 `session/cancel`，300ms 后强杀进程 |
+| CLI / MiniMax | `child.kill()`，退出后按 `AbortError` 处理 |
+| Loomy http | 同时 abort SSE 与 `POST /message` |
+| CDP（trae/doubao/alice/scnet） | 轮询循环检查 `signal.aborted`，立刻收工 |
+
+链式取消后，未派发的步骤直接跳过（`skipped: [{reason:'整条链已取消'}]`），已完成的步骤保留输出。
+前端「取消」按钮取消最近一次派发；没有活动目标时退化为取消全部在途任务。
 
 ## 5. 统一事件模型
 

@@ -361,7 +361,7 @@ async function newChat(cdp) {
  */
 export async function runDoubao(
   agentId,
-  { prompt, emit, port = DEFAULT_PORT, idleMs = 3000, timeoutMs = 300000, newTopic = true, model } = {},
+  { prompt, emit, port = DEFAULT_PORT, idleMs = 3000, timeoutMs = 300000, newTopic = true, model, signal } = {},
 ) {
   const t0 = Date.now()
   emit.start({ transport: 'cdp', port })
@@ -374,6 +374,10 @@ export async function runDoubao(
     const ready = Date.now()
     let has = false
     while (Date.now() - ready < 20000) {
+      if (signal?.aborted) {
+        emit.cancelled('用户取消')
+        return { ok: false, aborted: true, transport: 'cdp' }
+      }
       has = !!(await cdp.eval(`!!document.querySelector('${INPUT_SEL}')`))
       if (has) break
       await new Promise((r) => setTimeout(r, 500))
@@ -478,8 +482,14 @@ export async function runDoubao(
     let announced = false
     const deadline = Date.now() + timeoutMs
     let text = ''
+    let cancelled = false
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 700))
+      if (signal?.aborted) {
+        cancelled = true
+        emit.log('收到取消信号，停止等待豆包输出', 'warn')
+        break
+      }
       const n = await countAssistant()
       // 只有气泡数量超过基线，才是这一轮的新回复。
       // 兜底：极少数情况下气泡节点被虚拟列表回收，计数不涨但正文已经变了 —— 这里放宽：
@@ -522,6 +532,11 @@ export async function runDoubao(
           text = cur
         }
       }
+    }
+
+    if (cancelled) {
+      emit.cancelled('用户取消')
+      return { ok: false, aborted: true, text: (text || '').trim(), transport: 'cdp' }
     }
 
     const ms = Date.now() - t0

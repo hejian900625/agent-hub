@@ -18,13 +18,29 @@ import { runDoubao } from './doubao-cdp.mjs'
 
 /* ------------------------- ACP 轨 ------------------------- */
 
-export async function runAcp(agentId, { prompt, cwd, emit, transport = 'acp', model }) {
+const abortError = (msg = 'cancelled') => Object.assign(new Error(msg), { name: 'AbortError' })
+
+export async function runAcp(agentId, { prompt, cwd, emit, transport = 'acp', model, signal }) {
   const agent = getAgent(agentId)
   const t = agent.transports[transport]
   if (!t) throw new Error(`${agentId} has no ${transport} transport`)
 
   const client = new AcpClient({ transport: t, cwd, label: agentId })
   emit.start({ transport: 'acp', cwd })
+
+  // 全局取消：先发 session/cancel 让 agent 自己收尾，300ms 后强杀进程
+  const onAbort = () => {
+    try {
+      client.cancel()
+    } catch {}
+    setTimeout(() => {
+      try {
+        client.kill()
+      } catch {}
+    }, 300)
+  }
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener('abort', onAbort, { once: true })
 
   client.on('stderr', (d) => emit.log(String(d).trim().slice(0, 400), 'debug'))
   client.on('permission', (p) => emit.permission(p.toolCall?.toolCallId, p.options, p))
@@ -95,16 +111,21 @@ export async function runAcp(agentId, { prompt, cwd, emit, transport = 'acp', mo
     emit.done({ stopReason, sessionId: client.sessionId })
     return { ok: true, code: 0, sessionId: client.sessionId, stopReason, text }
   } catch (e) {
+    if (signal?.aborted) {
+      emit.cancelled('用户取消')
+      throw abortError()
+    }
     emit.error(e.message, { stderr: client.stderrTail.slice(-1500) })
     throw e
   } finally {
+    signal?.removeEventListener('abort', onAbort)
     setTimeout(() => client.kill(), 1500)
   }
 }
 
 /* ------------------------- CLI 轨 ------------------------- */
 
-export async function runCli(agentId, { prompt, cwd, emit, transport = 'cli', extraArgs = [], model }) {
+export async function runCli(agentId, { prompt, cwd, emit, transport = 'cli', extraArgs = [], model, signal }) {
   const runId = nextRunId(agentId)
   const agent = getAgent(agentId)
   const t = agent.transports[transport]
@@ -128,6 +149,14 @@ export async function runCli(agentId, { prompt, cwd, emit, transport = 'cli', ex
     stdin: 'pipe',
     env: { AGENT_HUB_RUN_ID: runId || '', AGENT_HUB_AGENT: agentId },
   })
+
+  const onAbort = () => {
+    try {
+      child.kill()
+    } catch {}
+  }
+  if (signal?.aborted) onAbort()
+  else signal?.addEventListener('abort', onAbort, { once: true })
 
   // 关闭 stdin：不给 EOF 的话部分 CLI（Qoder）会一直挂着等输入
   try {
@@ -159,6 +188,11 @@ export async function runCli(agentId, { prompt, cwd, emit, transport = 'cli', ex
   })
 
   const code = await new Promise((resolve) => child.on('exit', resolve))
+  signal?.removeEventListener('abort', onAbort)
+  if (signal?.aborted) {
+    emit.cancelled('用户取消')
+    throw abortError()
+  }
   if (code !== 0) {
     emit.error(`${agentId} cli exited ${code}`, { stderr: errBuf.slice(-1500) })
     throw new Error(`${agentId} exited ${code}`)
@@ -391,6 +425,8 @@ async function runAgentCore(agentId, opts) {
       try {
         return await runLoomy(agentId, { ...opts, agent: t.http.agent })
       } catch (e) {
+        // 取消不是「轨失败」，绝不能拿 ACP 再跑一遍
+        if (opts.signal?.aborted || e?.name === 'AbortError') throw e
         if (!want.canAcp) throw e
         opts.emit.log(`opencode http 轨失败（${e.message.slice(0, 120)}），回退 ACP`, 'warn')
         return await runAcp(agentId, { ...opts, transport: 'acp' })
@@ -399,6 +435,7 @@ async function runAgentCore(agentId, opts) {
     try {
       return await runAcp(agentId, { ...opts, transport: 'acp' })
     } catch (e) {
+      if (opts.signal?.aborted || e?.name === 'AbortError') throw e
       if (!want.canHttp) throw e
       opts.emit.log(`ACP 轨失败（${e.message.slice(0, 120)}），回退 http`, 'warn')
       return await runLoomy(agentId, { ...opts, agent: t.http.agent })

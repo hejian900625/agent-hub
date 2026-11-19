@@ -98,6 +98,7 @@
       <div class="bar">
         <textarea id="prompt" placeholder="输入指令…（Ctrl+Enter 发送）"></textarea>
         <button id="send">派发</button>
+        <button class="ghost" id="cancel" title="取消当前链/批次/全部在途任务">取消</button>
         <button class="ghost" id="clear">清屏</button>
       </div>
       <div class="bar" id="targets"></div>
@@ -111,6 +112,7 @@ const logEl = $('#log')
 let agents = []
 let selected = new Set()
 let mode = 'single'
+let activeTarget = null // 最近一次派发的取消句柄：{runId} | {batchId} | {groupId}
 
 /* ---------- 拉取 agent 列表 ---------- */
 async function loadAgents(fresh) {
@@ -316,6 +318,7 @@ async function dispatch() {
 
   if (mode === 'single') {
     const { runId } = await post('/api/run', { agent: ids[0], prompt, cwd, model: modelFor(ids[0]) })
+    activeTarget = runId ? { runId } : null
     log(`→ ${label(ids[0])} 已派发 (${runId})`, 'sys')
   } else if (mode === 'fanout') {
     // 先把每个 agent 的模型定下来（含默认值），再派发 —— 日志和请求体用同一份，不会对不上
@@ -323,6 +326,7 @@ async function dispatch() {
     log(`→ 并行分发至 ${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' / ')}（每家独立沙箱）`, 'sys')
     const out = await post('/api/fanout', { agents: plan, prompt, cwd })
     if (out.error) return log(`派发失败：${out.error}`, 'err')
+    activeTarget = out.batchId ? { batchId: out.batchId } : null
     for (const s of out.sandboxes || []) {
       const what = s.note || `复制 ${s.copied} 个文件`
       log(`沙箱 ${label(s.agent)} → ${s.dir}（${what}）`, 'sys', s.agent)
@@ -347,6 +351,7 @@ async function dispatch() {
     const cname = $('#contract').selectedOptions[0]?.textContent || ctype
     log(`→ 链式流水：${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' → ')} · 每步输出契约：${cname}`, 'sys')
     const out = await post('/api/orchestrate', { plan, cwd })
+    if (out.groupId) activeTarget = { groupId: out.groupId }
     if (out.skipped?.length) {
       for (const s of out.skipped) log(`跳过第 ${s.index + 1} 步 ${label(s.agent)}：${s.reason}`, 'err', s.agent)
     }
@@ -467,6 +472,9 @@ function handle(ev) {
     case 'done':
       log(`完成 (${ev.stopReason || 'ok'})`, 'sys', ev.agentId)
       break
+    case 'cancelled':
+      log(`已取消${ev.reason ? `：${ev.reason}` : ''}`, 'err', ev.agentId)
+      break
     case 'error':
       log(`错误: ${ev.message}`, 'err', ev.agentId)
       break
@@ -491,6 +499,16 @@ $('#prompt').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); dispatch() }
 })
 $('#clear').onclick = () => { logEl.innerHTML = ''; for (const k in inflight) delete inflight[k] }
+
+$('#cancel').onclick = async () => {
+  const target = activeTarget || { all: true }
+  const what = activeTarget
+    ? Object.entries(activeTarget).map(([k, v]) => `${k}=${v}`).join(' ')
+    : '全部在途任务'
+  const r = await post('/api/cancel', target)
+  if (r.ok) log(`已请求取消：${what}（在途步骤会收到 abort，未派发的直接跳过）`, 'sys')
+  else log(`取消失败：${r.error || '未知错误'}`, 'err')
+}
 
 $('#reauth').onclick = async () => {
   log('正在逐家做真实握手（qoder ~8s / minimax ~11s / workbuddy ~10s）…', 'sys')

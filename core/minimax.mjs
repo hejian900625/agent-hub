@@ -98,8 +98,8 @@ function handleLine(line, emit, stats) {
  * @param {string} agentId
  * @param {{prompt:string, cwd?:string, emit:object, transport?:object, model?:string, extraArgs?:string[]}} o
  */
-export function runMinimax(agentId, { prompt, cwd, emit, transport, model, extraArgs = [] }) {
-  return new Promise((resolve) => {
+export function runMinimax(agentId, { prompt, cwd, emit, transport, model, extraArgs = [], signal }) {
+  return new Promise((resolve, reject) => {
     const runId = nextRunId(agentId)
     const stats = { text: 0, sessionId: null, final: '', output: '', exitStatus: null, model: null }
     seenTools.clear()
@@ -125,6 +125,16 @@ export function runMinimax(agentId, { prompt, cwd, emit, transport, model, extra
       env: { AGENT_HUB_RUN_ID: runId || '', AGENT_HUB_AGENT: agentId },
     })
 
+    let aborted = false
+    const onAbort = () => {
+      aborted = true
+      try {
+        child.kill()
+      } catch {}
+    }
+    if (signal?.aborted) onAbort()
+    else signal?.addEventListener('abort', onAbort, { once: true })
+
     lineReader(child.stdout, (line) => handleLine(line, emit, stats))
     let errBuf = ''
     child.stderr.on('data', (d) => {
@@ -141,6 +151,12 @@ export function runMinimax(agentId, { prompt, cwd, emit, transport, model, extra
     })
 
     child.on('exit', (code) => {
+      signal?.removeEventListener('abort', onAbort)
+      if (aborted || signal?.aborted) {
+        emit.cancelled('用户取消')
+        reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }))
+        return
+      }
       const ok = code === 0 && (stats.exitStatus === 'succeeded' || stats.final)
       if (!ok && errBuf.trim()) emit.error(errBuf.trim().slice(0, 2000))
       if (!ok && !stats.text) emit.error(`mcode 退出码 ${code}，无输出（若为 134，说明没用 Electron 运行时）`)

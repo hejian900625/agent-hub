@@ -185,7 +185,7 @@ const readAssistant = `(()=>{
  */
 export async function runTrae(
   agentId,
-  { prompt, emit, port = DEFAULT_PORT, idleMs = 3000, timeoutMs = 300000, newTopic = false }
+  { prompt, emit, port = DEFAULT_PORT, idleMs = 3000, timeoutMs = 300000, newTopic = false, signal }
 ) {
   const { launched } = await ensureTraeCdp({ port })
   const c = await connectTrae(port)
@@ -262,9 +262,15 @@ export async function runTrae(
     let stableSince = 0
     let sentAny = false
     let announcedIdle = false
+    let cancelled = false
 
     for (;;) {
       await sleep(900)
+      if (signal?.aborted) {
+        cancelled = true
+        emit.log('收到取消信号，停止等待 Trae 输出', 'warn')
+        break
+      }
       if (Date.now() - t0 > timeoutMs) {
         emit.log(`${Math.round(timeoutMs / 1000)}s 超时，返回已捕获内容`, 'warn')
         break
@@ -297,6 +303,11 @@ export async function runTrae(
         if (Date.now() - stableSince > idleMs) break
       }
       // cur 为空说明这一条还在流式渲染，下一轮再看
+    }
+
+    if (cancelled) {
+      emit.cancelled('用户取消')
+      return { ok: false, aborted: true, text: last, transport: 'cdp' }
     }
 
     const ms = Date.now() - t0

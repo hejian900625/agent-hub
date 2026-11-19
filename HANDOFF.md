@@ -121,6 +121,11 @@ agent-hub/
     喂给下游的是**规范化后**的内容（去围栏 / 压平 JSON），不是 agent 原始回复。
     契约和任务本身矛盾时（比如要求「不要代码块」又给了 code 契约）重试也不会过 —— 这是特性，
     失败要显式暴露，别让脏数据往下流。
+14. **取消靠 AbortController 级联，不要只清 UI**：`/api/run` 一个 run 一个句柄，
+    `/api/orchestrate` 返回 `groupId`、`/api/fanout` 有 `batchId`，`POST /api/cancel`
+    接受任一（或 `{all:true}`）。每个 adapter 必须吃 `signal`：ACP 先 `session/cancel`
+    再 kill，CLI kill 子进程，Loomy abort SSE + POST，CDP 在轮询里查 `signal.aborted`。
+    链式取消后未派发的步骤记为 skipped，不会再启动。
 
 ---
 
@@ -142,6 +147,7 @@ agent-hub/
   token 过期/积分归零不再显示成绿色
 - 并行分发同名文件互相覆盖 → `/api/fanout` 每 target 独立沙箱 + 跑完 diff 报告
 - 链式流水把上一步的原始回复直接喂下游 → 每步 `expect` 契约 + 校验 + 带错重试 + 跳过后继
+- 链式跑到一半发现方向错了只能干等 → AbortController 贯穿全链，级联取消在途 adapter + 跳过未派发步骤
 
 ---
 

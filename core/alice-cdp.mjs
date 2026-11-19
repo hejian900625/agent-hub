@@ -184,7 +184,7 @@ function isPendingOnly(t) {
   return s.split('\n').every((line) => !line.trim() || ALICE_PENDING_RE.test(line.trim()))
 }
 
-export async function runAlice(agentId, { prompt, emit, port = DEFAULT_PORT, newTopic = true, idleMs = 6000, timeoutMs = 300000, model }) {
+export async function runAlice(agentId, { prompt, emit, port = DEFAULT_PORT, newTopic = true, idleMs = 6000, timeoutMs = 300000, model, signal }) {
   await ensureAlice({ port })
   const c = await connectAlice(port)
   emit.start({ transport: 'cdp', port })
@@ -225,9 +225,15 @@ export async function runAlice(agentId, { prompt, emit, port = DEFAULT_PORT, new
     let last = ''
     let stableSince = 0
     let sentAny = false
+    let cancelled = false
 
     for (;;) {
       await sleep(900)
+      if (signal?.aborted) {
+        cancelled = true
+        emit.log('收到取消信号，停止等待 Alice 输出', 'warn')
+        break
+      }
       if (Date.now() - t0 > timeoutMs) {
         emit.log(`${timeoutMs / 1000}s 超时，返回已捕获内容`, 'warn')
         break
@@ -262,6 +268,11 @@ export async function runAlice(agentId, { prompt, emit, port = DEFAULT_PORT, new
         continue
       }
       if (Date.now() - stableSince > idleMs) break
+    }
+
+    if (cancelled) {
+      emit.cancelled('用户取消')
+      return { ok: false, aborted: true, text: last, transport: 'cdp' }
     }
 
     // 用 queryLLMLogs 拿 usage，失败不影响主流程
