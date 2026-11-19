@@ -172,6 +172,68 @@ function dispatchOf(a, live) {
   return { ok: true, via, detail: 'CLI/ACP 轨，无需本地客户端' }
 }
 
+/**
+ * 能力矩阵：额度查询 / 会话执行 / 模型列举是三条独立链路，可达性可以不一样。
+ * 主状态只看「能不能建会话」（用户真正关心的是能不能派任务），其余能力用三个小标记表达。
+ */
+function capabilitiesOf(a, auth, live, models, modelsFetched, dispatch) {
+  const id = a.id
+  const guiLike = ['trae', 'doubao', 'alice', 'scnet'].includes(id)
+  const q = auth.quota || {}
+
+  let quota
+  if (q.ok === true) {
+    const text = q.kind === 'credits' ? String(q.detail || '可查').split('，')[0] : '请求 200'
+    quota = { ok: true, text }
+  } else if (q.ok === false) quota = { ok: false, text: '异常' }
+  else quota = { ok: null, text: '未知' }
+
+  let sessionOk = null
+  let sessionWhy = ''
+  if (id === 'trae') {
+    sessionOk = !!live?.cdp?.up && auth.level !== 'none'
+    sessionWhy = sessionOk ? '' : !live?.cdp?.up ? 'CDP 未监听' : '未登录'
+  } else if (id === 'doubao' || id === 'alice') {
+    sessionOk = !!live?.up && modelsFetched > 0
+    sessionWhy = sessionOk ? '' : !live?.up ? 'CDP 未监听' : '读不到模型目录（可能未登录）'
+  } else if (id === 'scnet') {
+    sessionOk = !!live?.up && live?.running !== false
+    sessionWhy = sessionOk ? '' : !live?.up ? 'CDP 未监听' : '页面不在任务页（可能未登录）'
+  } else if (id === 'loomy') {
+    sessionOk = !!dispatch?.ok
+    sessionWhy = sessionOk ? '' : 'ACP 不可用'
+  } else {
+    const hs = auth.checks?.handshake
+    if (auth.level === 'none') sessionOk = false
+    else if (hs?.ok === true) sessionOk = true
+    sessionWhy = sessionOk === true ? '' : sessionOk === false ? hs?.detail || '未登录' : '未握手'
+  }
+
+  const count = Array.isArray(models) ? models.length : 0
+  let modelCap
+  if (id === 'alice' || id === 'doubao') modelCap = modelsFetched > 0 ? { ok: true, text: `${count} 个` } : { ok: null, text: '未知' }
+  else if (id === 'scnet') modelCap = { ok: true, text: 'SCNet-Max' }
+  else modelCap = count > 0 ? { ok: true, text: `${count} 个` } : { ok: null, text: '未知' }
+
+  const anyCap = quota.ok === true || modelCap.ok === true
+  let primary
+  if (auth.level === 'none') primary = 'down'
+  else if (sessionOk === true) primary = 'ready'
+  else if (sessionOk === false) primary = anyCap ? 'partial' : 'idle'
+  else primary = 'config'
+
+  const channel = dispatch?.via || ''
+  const channelText = sessionOk === false && guiLike ? `${channel} 未监听` : sessionOk === null && !guiLike ? `${channel}（未握手）` : channel
+
+  return {
+    primary,
+    quota,
+    session: { ok: sessionOk, text: sessionOk === true ? '可建' : sessionOk === false ? '不可达' : '未验证', why: sessionWhy },
+    models: modelCap,
+    channel: channelText,
+  }
+}
+
 async function describeAgent(a, { fresh = false, verify = false, quotaProbe = false } = {}) {
   const live = await liveOf(a)
   // 运行时模型清单可覆盖注册表兜底（alice / doubao 必须问客户端）
@@ -202,7 +264,8 @@ async function describeAgent(a, { fresh = false, verify = false, quotaProbe = fa
     live,
     modelsFetched,
   })
-  return { ...a, models, auth, live, dispatch: dispatchOf(a, live) }
+  const dispatch = dispatchOf(a, live)
+  return { ...a, models, auth, live, dispatch, capabilities: capabilitiesOf(a, auth, live, models, modelsFetched, dispatch) }
 }
 
 function serveStatic(req, res) {
