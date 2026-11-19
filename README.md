@@ -60,6 +60,8 @@ mcode login                     # MiniMax（Node 24 有坑，见 §6）
 | GET | `/api/agents` | agent 列表 + 安装/登录/通道状态 + models/defaultModel |
 | GET | `/api/events` | SSE 全量事件流 |
 | POST | `/api/run` | `{agent, prompt, cwd?, transport?, model?}` → `{runId}`（model 仅在 caps 含 model-select 的 agent 上生效） |
+| POST | `/api/fanout` | **并行分发（推荐）**：`{agents:[{agent,model?}], prompt, cwd?, isolate?}` → 每家一个沙箱子目录，跑完自动出 diff |
+| GET | `/api/fanout` / `/api/fanout/<batchId>` | 批次列表 / 单批进度 + 对比报告 |
 | POST | `/api/orchestrate` | `{plan:[{agent,prompt,model?,after?:[]}], cwd?}` |
 | GET | `/api/runs` | 运行中/近期任务 |
 | POST | `/api/login` | `{agent}` 调起该 agent 的登录流程 |
@@ -76,7 +78,28 @@ curl -s localhost:7788/api/orchestrate -H 'content-type: application/json' -d '{
     {"agent":"trae","prompt":"按方案改代码","after":[0]},
     {"agent":"workbuddy","prompt":"review 上述改动","after":[1]}
   ]}'
+
+# 并行对比：同一任务发给 3 家，各自写在 <cwd>/<agent>-<时间戳>/ 里
+curl -s localhost:7788/api/fanout -H 'content-type: application/json' -d '{
+  "agents":[{"agent":"qoder"},{"agent":"workbuddy"},{"agent":"minimax"}],
+  "prompt":"实现一个 LRU 缓存，写到 lru.js",
+  "cwd":"D:/project/lru-bench"}'
 ```
+
+### 4.1 并行分发为什么要沙箱
+
+直接并发跑同一个 cwd 时，`package.json`、`src/index.js` 这类同名文件会互相覆盖，
+最后既分不清是谁写的，也没法比较。`/api/fanout` 的做法：
+
+1. 每个 agent 一个 `<cwd>/<agent>-<YYYYMMDD-HHmmss>/`；
+2. 源目录先做 baseline 快照，再把过滤后的文件复制进各沙箱
+   （跳过 `node_modules` / `.git` / `dist` / 历史沙箱；>800 文件或 >60MB 只建空目录）；
+3. 派发时注入【沙箱约束】，要求把 prompt 里的绝对路径映射进沙箱；
+4. 全部跑完后快照每个沙箱，输出「新增 / 修改 / 删除」和两两差异；
+5. 报告写到 `<cwd>/fanout-<batchId>.report.json`，同时 `GET /api/fanout/<batchId>` 可查。
+
+注意：cwd 只能约束相对路径。若 prompt 写死绝对路径且 agent 不听话，仍可能写到外面——
+沙箱是降低概率 + 让结果可比，不是安全边界。
 
 ## 5. 统一事件模型
 

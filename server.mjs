@@ -1,6 +1,7 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { bus, makeEmitter, nextRunId } from './core/bus.mjs'
 import { listAgents, getAgent } from './core/registry.mjs'
@@ -15,6 +16,16 @@ import { doubaoStatus } from './core/doubao-cdp.mjs'
 import { scnetStatus } from './core/scnet-cdp.mjs'
 import { aliceModels } from './core/alice-cdp.mjs'
 import { doubaoModels } from './core/doubao-cdp.mjs'
+import {
+  newBatchId,
+  stamp,
+  createSandbox,
+  snapshot,
+  measureTree,
+  buildReport,
+  writeReport,
+  sandboxPrompt,
+} from './core/fanout.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const WEB = path.join(__dirname, 'web')
@@ -23,6 +34,9 @@ let ACTUAL_PORT = PORT
 
 /** 运行中的任务表 */
 const runs = new Map() // runId -> {runId, agentId, prompt, cwd, startedAt, status, abort}
+
+/** 并行分发批次（沙箱 + 对比报告） */
+const fanoutBatches = new Map() // batchId -> batch
 
 /* ----------------------------- SSE ----------------------------- */
 
@@ -371,6 +385,82 @@ async function orchestrate({ plan, cwd }) {
   return { runIds: [...done.entries()].map(([i, runId]) => ({ index: i, agent: plan[i].agent, runId })) }
 }
 
+/* ---------------------- 并行分发：沙箱隔离 ---------------------- */
+
+/**
+ * fanout 模式下每个 agent 派生独立子目录 `<cwd>/<agent>-<时间戳>/`，
+ * 避免同名文件互相覆盖；全部跑完后对每个沙箱做快照并生成对比报告。
+ */
+function startFanout({ agents, prompt, cwd, isolate = true }) {
+  const baseDir = cwd ? path.resolve(cwd) : path.join(os.tmpdir(), 'agent-hub-fanout')
+  const isolated = isolate && agents.length > 1
+  const batch = {
+    id: newBatchId(),
+    baseDir,
+    isolated,
+    createdAt: Date.now(),
+    members: [],
+    sandboxes: [],
+    runIds: [],
+    snapshots: {},
+    baseline: null,
+  }
+
+  if (isolated) {
+    // baseline 用于回答「谁改了/加了什么」；超大目录跳过（只对比沙箱之间的差异）
+    const size = measureTree(baseDir)
+    if (size.files <= 800 && size.bytes <= 60 * 1024 * 1024) batch.baseline = snapshot(baseDir)
+    else batch.baselineSkipped = true
+  }
+
+  const batchStamp = stamp()
+  for (const s of agents) {
+    const agent = getAgent(s.agent)
+    let dir = baseDir
+    let meta = null
+    if (isolated) {
+      meta = createSandbox({ baseDir, agentId: s.agent, batchStamp })
+      dir = meta.dir
+    }
+    // 沙箱约束放在最前面：ROLE_PREFIX 会再包一层，两者不冲突
+    const finalPrompt = isolated ? sandboxPrompt(dir, baseDir) + prompt : prompt
+    const runId = executeRun({
+      agentId: s.agent,
+      prompt: finalPrompt,
+      cwd: dir,
+      transport: s.transport,
+      model: s.model || agent.defaultModel,
+      extraArgs: s.extraArgs,
+      concurrent: agents.length > 1,
+    })
+    batch.members.push({ agent: s.agent, dir })
+    batch.sandboxes.push({ agent: s.agent, dir, ...(meta || {}) })
+    batch.runIds.push(runId)
+  }
+
+  fanoutBatches.set(batch.id, batch)
+  watchBatch(batch)
+  setTimeout(() => fanoutBatches.delete(batch.id), 60 * 60 * 1000)
+  return batch
+}
+
+function watchBatch(batch) {
+  const t0 = Date.now()
+  const tick = () => {
+    const pending = batch.runIds.some((id) => runs.get(id)?.status === 'running')
+    if (pending && Date.now() - t0 < 20 * 60 * 1000) return setTimeout(tick, 800)
+    try {
+      batch.report = buildReport(batch)
+      batch.reportFile = writeReport(batch.baseDir, batch.report)
+    } catch (e) {
+      batch.error = e.message
+    }
+    batch.ready = true
+    batch.endedAt = Date.now()
+  }
+  setTimeout(tick, 600)
+}
+
 /* -------------------------- 文本聚合 -------------------------- */
 
 // 收集每个 run 的文本，供下游依赖注入
@@ -472,6 +562,69 @@ const server = http.createServer(async (req, res) => {
         extraArgs: b.extraArgs,
       })
       return json(res, 200, { runId })
+    }
+
+    /* ------------------ 并行分发（沙箱隔离 + 对比） ------------------ */
+
+    if (url.pathname === '/api/fanout' && req.method === 'POST') {
+      const gate = fanoutGate(req)
+      if (gate) return json(res, 409, gate)
+      const b = await body(req)
+      const list = Array.isArray(b.agents) ? b.agents : []
+      if (!list.length) return json(res, 400, { error: 'agents required' })
+      const agents = list.map((x) => (typeof x === 'string' ? { agent: x } : x))
+      try {
+        agents.forEach((s) => getAgent(s.agent))
+      } catch (e) {
+        return json(res, 400, { error: e.message })
+      }
+      if (!b.prompt) return json(res, 400, { error: 'prompt required' })
+      const batch = startFanout({ agents, prompt: String(b.prompt), cwd: b.cwd, isolate: b.isolate !== false })
+      return json(res, 200, {
+        ok: true,
+        batchId: batch.id,
+        isolated: batch.isolated,
+        baseDir: batch.baseDir,
+        sandboxes: batch.sandboxes.map((s) => ({
+          agent: s.agent,
+          dir: s.dir,
+          copied: s.copied,
+          skipped: s.skipped,
+          note: s.note,
+        })),
+        runs: batch.runIds.map((runId, i) => ({ agent: batch.members[i].agent, runId })),
+      })
+    }
+
+    if (url.pathname === '/api/fanout' && req.method === 'GET') {
+      return json(res, 200, {
+        batches: [...fanoutBatches.values()].map((b) => ({
+          batchId: b.id,
+          isolated: b.isolated,
+          createdAt: b.createdAt,
+          ready: !!b.ready,
+          summary: b.report?.summary,
+        })),
+      })
+    }
+
+    if (url.pathname.startsWith('/api/fanout/') && req.method === 'GET') {
+      const id = decodeURIComponent(url.pathname.slice('/api/fanout/'.length))
+      const b = fanoutBatches.get(id)
+      if (!b) return json(res, 404, { error: 'unknown batch' })
+      return json(res, 200, {
+        batchId: b.id,
+        isolated: b.isolated,
+        baseDir: b.baseDir,
+        ready: !!b.ready,
+        error: b.error || null,
+        reportFile: b.reportFile || null,
+        runs: b.runIds.map((runId, i) => {
+          const r = runs.get(runId)
+          return { agent: b.members[i].agent, runId, status: r?.status || 'gone', error: r?.error }
+        }),
+        report: b.report || null,
+      })
     }
 
     if (url.pathname === '/api/orchestrate' && req.method === 'POST') {

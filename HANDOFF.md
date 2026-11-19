@@ -112,6 +112,10 @@ agent-hub/
     minimax 最小 prompt、workbuddy 一句 hi、trae 积分接口、loomy ACP initialize、GUI 读模型目录）
     成功才到 `handshake`；只有 Trae 能判到 `quota`。`/api/agents` 走快路径，
     `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），别在页面首屏同步跑。
+12. **并行分发一律走 `/api/fanout`，不要并发打 `/api/run`**：前者会给每个 target 建
+    `<cwd>/<agent>-<时间戳>/` 沙箱（复制源目录、跳过 node_modules/.git/dist），跑完自动出
+    `fanout-<batchId>.report.json`（新增/修改/删除 + 两两差异）。并发打 `/api/run` 共用
+    一个 cwd 会互相覆盖同名文件。`/api/run` 的 `concurrent` 只负责同名文件的串行锁，不隔离目录。
 
 ---
 
@@ -131,6 +135,7 @@ agent-hub/
 - Loomy 刷 200+ 行空白 `⚙ bash {}` → tool 事件按 `id+status` 去重
 - 「已登录」绿灯名不副实（只 stat 了 credential 文件）→ 三级状态 + 真实握手探测，
   token 过期/积分归零不再显示成绿色
+- 并行分发同名文件互相覆盖 → `/api/fanout` 每 target 独立沙箱 + 跑完 diff 报告
 
 ---
 

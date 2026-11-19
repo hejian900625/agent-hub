@@ -313,8 +313,15 @@ async function dispatch() {
   } else if (mode === 'fanout') {
     // 先把每个 agent 的模型定下来（含默认值），再派发 —— 日志和请求体用同一份，不会对不上
     const plan = ids.map((agent) => ({ agent, model: modelFor(agent) }))
-    log(`→ 并行分发至 ${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' / ')}`, 'sys')
-    const out = await Promise.all(plan.map((p) => post('/api/run', { agent: p.agent, prompt, cwd, model: p.model })))
+    log(`→ 并行分发至 ${plan.map((p) => `${label(p.agent)}(${p.model || '默认'})`).join(' / ')}（每家独立沙箱）`, 'sys')
+    const out = await post('/api/fanout', { agents: plan, prompt, cwd })
+    if (out.error) return log(`派发失败：${out.error}`, 'err')
+    for (const s of out.sandboxes || []) {
+      const what = s.note || `复制 ${s.copied} 个文件`
+      log(`沙箱 ${label(s.agent)} → ${s.dir}（${what}）`, 'sys', s.agent)
+    }
+    if (out.isolated) watchFanout(out.batchId)
+    else log('只有 1 个目标，未启用沙箱隔离', 'sys')
   } else {
     // after 用「id 下标」；plan 数组里多带一个 model 字段给日志用，发出去前再剥掉
     const plan = ids.map((agent, i) => ({ agent, prompt, cwd, model: modelFor(agent), after: i ? [i - 1] : [] }))
@@ -323,6 +330,39 @@ async function dispatch() {
   }
 }
 const post = (u, b) => fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json())
+
+/** 轮询并行批次的对比报告；全部跑完后把差异打进日志 */
+async function watchFanout(batchId) {
+  const t0 = Date.now()
+  while (Date.now() - t0 < 20 * 60 * 1000) {
+    await new Promise((r) => setTimeout(r, 2000))
+    let r
+    try {
+      r = await fetch(`/api/fanout/${encodeURIComponent(batchId)}`).then((x) => x.json())
+    } catch {
+      continue
+    }
+    if (!r || r.error) return log(`对比失败：${r?.error || '未知错误'}`, 'err')
+    if (!r.ready) continue
+    const rep = r.report
+    log(`—— 并行对比完成 · ${rep.summary} ——`, 'sys')
+    for (const a of rep.agents) {
+      log(`${label(a.agent)}：新增 ${a.added.length} / 修改 ${a.modified.length} / 删除 ${a.removed.length}，共 ${a.fileCount} 个文件`, 'sys', a.agent)
+    }
+    for (const c of rep.comparisons) {
+      if (c.differingCount === 0) log(`${label(c.a)} vs ${label(c.b)}：完全一致`, 'sys')
+      else {
+        const head = c.differing.slice(0, 8).join(', ')
+        log(`${label(c.a)} vs ${label(c.b)}：${c.differingCount} 个文件不同 → ${head}${c.differingCount > 8 ? ' …' : ''}`, 'sys')
+      }
+    }
+    if (rep.baselineSkipped) log('源目录过大，未做 baseline 快照，只比较沙箱之间的差异', 'sys')
+    if (r.reportFile) log(`完整报告：${r.reportFile}`, 'sys')
+    return
+  }
+  log('并行对比等待超时（20 分钟），请稍后看 /api/fanout/' + batchId, 'err')
+}
+
 const label = (id) => agents.find((a) => a.id === id)?.label || id
 const colorOf = (id) => agents.find((a) => a.id === id)?.accent || '#38bdf8'
 
