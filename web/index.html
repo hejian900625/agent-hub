@@ -37,6 +37,21 @@
   .spin{display:inline-block;width:9px;height:9px;border:2px solid #475569;border-top-color:#e2e8f0;
         border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px;margin-right:6px}
   @keyframes spin{to{transform:rotate(360deg)}}
+  #billpanel{position:fixed;top:0;right:0;bottom:0;width:min(580px,94vw);background:var(--panel);
+             border-left:1px solid var(--line);z-index:50;display:flex;flex-direction:column;
+             box-shadow:-24px 0 48px #0009}
+  #billpanel.hidden{display:none}
+  .bhead{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line)}
+  #billbody{flex:1;overflow:auto;padding:12px 14px}
+  .bcards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px}
+  .bcard{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .bcard b{font-size:15px;font-weight:600}
+  .bcard .k{color:var(--dim);font-size:10px;display:block;margin-bottom:1px}
+  table.bt{width:100%;border-collapse:collapse;font-size:11px;margin-bottom:14px}
+  table.bt th{color:var(--dim);font-weight:500;text-align:left;padding:4px 5px;border-bottom:1px solid var(--line)}
+  table.bt td{padding:4px 5px;border-bottom:1px solid #1a2434;white-space:nowrap}
+  table.bt td.pr{max-width:190px;overflow:hidden;text-overflow:ellipsis;color:var(--dim)}
+  .bsec{color:var(--dim);font-size:10px;letter-spacing:.5px;margin:10px 0 4px}
   .agent .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
   .tag{font-size:10px;padding:1px 6px;border-radius:999px;background:#0f172a;color:var(--dim);border:1px solid var(--line)}
   .tag.hot{color:var(--c);border-color:color-mix(in srgb,var(--c) 40%,transparent)}
@@ -76,6 +91,7 @@
   <span class="hint" id="conn">连接中…</span>
   <button class="ghost" id="reauth" title="重新探测各家登录状态（trae 会解密 storage.json 查积分）">刷新登录状态</button>
   <span class="hint" id="lastprobe" title="最近一次真实握手探测完成的时间">未探测</span>
+  <button class="ghost" id="bills" title="查看任务级账单（本地 JSONL，记录 token / 费用 / 积分）">账单</button>
   <div class="spacer"></div>
   <div class="tabs">
     <div class="tab active" data-mode="single">单发</div>
@@ -115,6 +131,17 @@
     </footer>
   </section>
 </main>
+
+<div id="billpanel" class="hidden">
+  <div class="bhead">
+    <b>任务账单</b>
+    <span class="hint" id="billfile"></span>
+    <span class="spacer"></span>
+    <button class="ghost" id="billrefresh">刷新</button>
+    <button class="ghost" id="billclose">关闭</button>
+  </div>
+  <div id="billbody"><span class="hint">加载中…</span></div>
+</div>
 
 <script>
 const $ = (s) => document.querySelector(s)
@@ -622,12 +649,15 @@ function handle(ev) {
       break
     case 'done':
       log(`完成 (${ev.stopReason || 'ok'})`, 'sys', ev.agentId)
+      scheduleBills()
       break
     case 'cancelled':
       log(`已取消${ev.reason ? `：${ev.reason}` : ''}`, 'err', ev.agentId)
+      scheduleBills()
       break
     case 'error':
       log(`错误: ${ev.message}`, 'err', ev.agentId)
+      scheduleBills()
       break
   }
 }
@@ -659,6 +689,99 @@ $('#cancel').onclick = async () => {
   const r = await post('/api/cancel', target)
   if (r.ok) log(`已请求取消：${what}（在途步骤会收到 abort，未派发的直接跳过）`, 'sys')
   else log(`取消失败：${r.error || '未知错误'}`, 'err')
+}
+
+/* ---------- 任务账单（本地 JSONL 的可视化） ---------- */
+const fmtNum = (v) => (v == null ? '—' : Number(v).toLocaleString('zh-CN'))
+const fmtUsd = (v) => (v == null ? '—' : `$${Number(v).toFixed(4)}`)
+const fmtCr = (v) => (v == null ? '—' : Number(v).toFixed(3))
+const billWhen = (ts) => new Date(Number(ts) || Date.now()).toLocaleString('zh-CN', { hour12: false })
+
+async function loadBills() {
+  const body = $('#billbody')
+  body.innerHTML = '<span class="hint">加载中…</span>'
+  let r
+  try {
+    r = await fetch('/api/bills?limit=200').then((x) => x.json())
+  } catch (e) {
+    body.innerHTML = `<span class="hint">读取失败：${esc(e.message)}</span>`
+    return
+  }
+  if (!r.ok) {
+    body.innerHTML = `<span class="hint">读取失败：${esc(r.error || 'unknown')}</span>`
+    return
+  }
+  $('#billfile').textContent = r.file || ''
+  const s = r.summary || {}
+  const all = r.allTime || {}
+  const agents = Object.entries(s.byAgent || {}).sort(
+    (a, b) => (b[1].costUsd || 0) - (a[1].costUsd || 0) || (b[1].credits || 0) - (a[1].credits || 0) || (b[1].total || 0) - (a[1].total || 0)
+  )
+  const byAgent = agents.length
+    ? `<table class="bt"><thead><tr><th>Agent</th><th>任务</th><th>输入</th><th>输出</th><th>费用</th><th>积分</th></tr></thead><tbody>${agents
+        .map(
+          ([id, a]) =>
+            `<tr><td>${esc(label(id))}</td><td>${a.runs}</td><td>${fmtNum(a.input)}</td><td>${fmtNum(a.output)}</td><td>${fmtUsd(a.costUsd)}</td><td>${fmtCr(a.credits)}</td></tr>`
+        )
+        .join('')}</tbody></table>`
+    : '<div class="hint">还没有账单记录。跑一个任务后这里会出现。</div>'
+
+  const days = Object.entries(s.byDay || {})
+    .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+    .slice(0, 7)
+  const byDay = days.length
+    ? `<table class="bt"><thead><tr><th>日期</th><th>任务</th><th>Token</th><th>费用</th><th>积分</th></tr></thead><tbody>${days
+        .map(
+          ([d, x]) =>
+            `<tr><td>${esc(d)}</td><td>${x.runs}</td><td>${fmtNum(x.total)}</td><td>${fmtUsd(x.costUsd)}</td><td>${fmtCr(x.credits)}</td></tr>`
+        )
+        .join('')}</tbody></table>`
+    : ''
+
+  const rows = (r.bills || [])
+    .map((b) => {
+      const u = b.usage || {}
+      const money =
+        [u.costUsd != null ? fmtUsd(u.costUsd) : '', u.credits != null ? `${fmtCr(u.credits)} 积分` : ''].filter(Boolean).join(' · ') || '—'
+      const status = b.status === 'done' ? '完成' : b.status === 'cancelled' ? '取消' : '失败'
+      const tokens = u.total ?? (u.input == null && u.output == null ? null : (u.input || 0) + (u.output || 0))
+      const tip = escAttr(`${b.id} · usage=${u.source || 'none'}${u.note ? ` · ${u.note}` : ''}`)
+      return `<tr title="${tip}">
+        <td>${esc(billWhen(b.ts))}</td>
+        <td>${esc(label(b.agentId))}<div class="hint">${esc(b.model || '')}</div></td>
+        <td>${status}</td><td>${fmtNum(tokens)}</td><td>${money}</td>
+        <td class="pr" title="${escAttr(b.prompt || '')}">${esc(b.prompt || '')}</td></tr>`
+    })
+    .join('')
+
+  body.innerHTML = `
+    <div class="bcards">
+      <div class="bcard"><span class="k">任务数</span><b>${s.runs || 0}</b><span class="hint"> 完成 ${s.done || 0} / 失败 ${s.error || 0} / 取消 ${s.cancelled || 0}</span></div>
+      <div class="bcard"><span class="k">累计费用（CLI 返回）</span><b>${fmtUsd(s.costUsd)}</b></div>
+      <div class="bcard"><span class="k">累计积分（Trae / Qoder）</span><b>${fmtCr(s.credits)}</b></div>
+      <div class="bcard"><span class="k">累计 token</span><b>${fmtNum(s.total)}</b><span class="hint"> in ${fmtNum(s.input)} / out ${fmtNum(s.output)}</span></div>
+    </div>
+    <div class="bsec">按 AGENT 聚合 · 全部历史 ${all.runs || 0} 个任务</div>
+    ${byAgent}
+    ${byDay ? `<div class="bsec">最近 7 天</div>${byDay}` : ''}
+    <div class="bsec">最近任务</div>
+    <table class="bt"><thead><tr><th>时间</th><th>Agent</th><th>状态</th><th>Token</th><th>费用/积分</th><th>任务</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="hint">暂无</td></tr>'}</tbody></table>
+    <div class="hint">费用与积分只记各 CLI 实际返回的值；未返回的显示「—」，不会当成 0。</div>
+  `
+}
+
+$('#bills').onclick = () => {
+  $('#billpanel').classList.remove('hidden')
+  loadBills()
+}
+$('#billclose').onclick = () => $('#billpanel').classList.add('hidden')
+$('#billrefresh').onclick = () => loadBills()
+function scheduleBills() {
+  setTimeout(() => {
+    const p = $('#billpanel')
+    if (p && !p.classList.contains('hidden')) loadBills()
+  }, 1200)
 }
 
 $('#reauth').onclick = async () => {

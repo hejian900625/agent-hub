@@ -65,6 +65,7 @@ mcode login                     # MiniMax（Node 24 有坑，见 §6）
 | POST | `/api/orchestrate` | `{plan:[{agent,prompt,model?,after?:[]}], cwd?}` |
 | POST | `/api/cancel` | `{runId}` / `{groupId}` / `{batchId}` / `{all:true}` → 级联取消在途任务 |
 | GET | `/api/runs` | 运行中/近期任务 |
+| GET | `/api/bills` | 任务账单：`?limit=200&agent=&group=&since=` → `{bills, summary, allTime, file}` |
 | POST | `/api/login` | `{agent}` 调起该 agent 的登录流程 |
 
 ```bash
@@ -833,7 +834,27 @@ Doubao / Alice 同理；Loomy 断客户端时会自动落到 ACP 轨，仍算可
 界面上：`刷新登录状态` 按钮 → 逐家 `GET /api/verify?agent=<id>&fresh=1`（绕过 5 分钟缓存）。
 点「未登录 · 点击登录」拉起登录流程后，前端会 6 秒后自动 `loadAgents(true)`，徽标自己转绿，不用手刷。
 
-## 9. 加一个新 agent
+## 9. 任务账单（ledger）
+
+每个 run 结束（`done` / `error` / `cancelled`）都会往 `~/.agent-hub/ledger.jsonl` 追加一行，
+记录 `id / ts / ms / agentId / model / status / groupId / parentRunId / cwd / prompt 摘要 / usage`。
+`usage` 统一成 `input / output / cacheRead / total / costUsd / credits / source / note`。
+
+**原则：只记实际返回的数字，未知保持 `null`**（界面显示「—」），绝不把「没报」记成 0。
+
+| Agent | 实际消耗来源 |
+|---|---|
+| Qoder | `result.total_credits`（本次调用的积分消耗） |
+| WorkBuddy | `result.total_cost_usd` + `usage` token |
+| MiniMax / Loomy / Alice | 各自 `usage` 事件里的 token |
+| Trae CN | 不返回单次消耗：用开跑前/结束后的积分余额差值估；同账号并发时可能串账 |
+| Doubao / SCNet | 通常没有 usage，记 `source=none` + note |
+
+查询：`GET /api/bills?limit=200`（可加 `agent` / `group` / `since`），返回总量、按 agent、按天聚合。
+界面右上角「账单」打开面板，能看到累计费用/积分/token、按 agent 聚合、最近 7 天和最近任务。
+账本路径可用 `AGENT_HUB_LEDGER` 覆盖（测试时避免污染真实账本）。
+
+## 10. 加一个新 agent
 
 只需在 `core/registry.mjs` 的 `AGENTS` 里加一条：
 
@@ -851,7 +872,7 @@ myagent: {
 
 UI、API、编排、事件流全自动生效。
 
-## 10. 目录
+## 11. 目录
 
 ```
 agent-hub/

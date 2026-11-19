@@ -70,6 +70,7 @@ agent-hub/
   core/bus.mjs           44 行  统一事件模型 makeEmitter()
   core/spawn.mjs        113 行  跨平台启动（.cmd 陷阱、isolationEnv、productEnv）
   core/auth.mjs         233 行  登录态探测（每家 CLI 真读的那个文件）
+  core/ledger.mjs       账本：run 结束写 ~/.agent-hub/ledger.jsonl + 聚合
   core/acp-client.mjs   212 行  ACP JSON-RPC over stdio
   core/loomy-http.mjs   291 行  opencode HTTP + SSE（端口发现 + tool 事件去重）
   core/alice-cdp.mjs    559 行  window.alice + DOM + 真实键盘事件 + 模型下拉
@@ -133,6 +134,9 @@ agent-hub/
     接受任一（或 `{all:true}`）。每个 adapter 必须吃 `signal`：ACP 先 `session/cancel`
     再 kill，CLI kill 子进程，Loomy abort SSE + POST，CDP 在轮询里查 `signal.aborted`。
     链式取消后未派发的步骤记为 skipped，不会再启动。
+15. **每个 run 必须落一条账单**：`executeRun` 的 `finally` 调 `appendBill(billOf(rec))`，
+    usage 由总线上的 `usage` 事件聚合（重试也累加）。只写实际返回的数字，未知保持 `null`；
+    Trae 的单次消耗用开跑前后积分差值估。账本 `~/.agent-hub/ledger.jsonl`，别提交进仓库。
 
 ---
 
@@ -159,6 +163,8 @@ agent-hub/
   `auth.via` 写明握手走的哪条通道
 - 7/8 家额度未知 → `quota.kind` 三态（credits/request/unknown）+ qoder 按需最小请求探针 +
   `lastOkAt` 落盘，界面给「上次成功 X 分钟前」
+- 任务花了多少钱看不到 → 每个 run 结束写一行 `~/.agent-hub/ledger.jsonl`（token / cost / credits），
+  `/api/bills` 聚合，界面「账单」面板看按 agent、按天和最近任务
 
 ---
 
