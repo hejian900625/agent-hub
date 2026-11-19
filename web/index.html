@@ -178,12 +178,14 @@ const LV_STYLE = {
  */
 const REACH_STYLE = {
   up: { color: '#22c55e', text: '可达' },
+  blocked: { color: '#f59e0b', text: '未启动' },
   config: { color: '#7d8da6', text: '仅配置' },
   down: { color: '#ef4444', text: '不可用' },
   'n/a': { color: '#7d8da6', text: '无需登录' },
 }
 
 function viaOf(a) {
+  if (a.dispatch?.via) return a.dispatch.via
   if (a.auth?.via) return a.auth.via
   const live = a.live || {}
   const guiPort = { doubao: 9335, alice: 9333, scnet: 9336 }[a.id]
@@ -223,7 +225,17 @@ function renderAgents() {
     const live = a.live
     const lv = a.auth?.level || 'none'
     const dot = (LV_STYLE[lv] || LV_STYLE.none).color
-    const reach = a.auth?.status === 'n/a' ? 'n/a' : lv === 'none' ? 'down' : lv === 'config' ? 'config' : 'up'
+    const dispatch = a.dispatch || { ok: true, via: '', detail: '' }
+    const reach =
+      a.auth?.status === 'n/a'
+        ? 'n/a'
+        : !dispatch.ok
+          ? 'blocked'
+          : lv === 'none'
+            ? 'down'
+            : lv === 'config'
+              ? 'config'
+              : 'up'
     const rs = REACH_STYLE[reach]
     const via = viaOf(a)
     const quota = verifying.has(a.id)
@@ -237,7 +249,7 @@ function renderAgents() {
       : ''
     const loginCls = reach === 'down' ? ' class="login"' : ''
     const stateTip = escAttr(
-      `${a.label}：${(LV_STYLE[lv] || LV_STYLE.none).name}${a.auth?.detail ? ` · ${a.auth.detail}` : ''}${a.auth?.lastOkAt ? ` · 上次成功 ${agoText(a.auth.lastOkAt)}` : ''}`
+      `${a.label}：${rs.text}${dispatch.detail ? ` · ${dispatch.detail}` : ''} · 登录态${(LV_STYLE[lv] || LV_STYLE.none).name}${a.auth?.detail ? `（${a.auth.detail}）` : ''}${a.auth?.lastOkAt ? ` · 上次成功 ${agoText(a.auth.lastOkAt)}` : ''}`
     )
     return `
     <div class="agent ${selected.has(a.id) ? 'sel' : ''}" data-id="${a.id}" style="--c:${a.accent}">
@@ -245,7 +257,7 @@ function renderAgents() {
         a.installed ? '' : '<span style="margin-left:auto;color:#ef4444;font-size:10px">未安装</span>'
       }</div>
       <div class="vd cols">
-        <span${loginCls}${reach === 'down' ? ` data-id="${a.id}"` : ''} style="color:${rs.color}">${rs.text}${reach === 'down' ? '（点击登录）' : ''}</span>
+        <span${loginCls}${reach === 'down' ? ` data-id="${a.id}"` : ''} title="${stateTip}" style="color:${rs.color}">${rs.text}${reach === 'down' ? '（点击登录）' : ''}</span>
         <span class="sep">·</span><span>通道 ${esc(via)}</span>
         <span class="sep">·</span><span>${esc(quota)}</span>${probe}
       </div>

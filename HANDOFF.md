@@ -111,7 +111,9 @@ agent-hub/
     只看凭据文件只能到 `config`，界面必须写「仅凭据·未验证」；真握手（qoder `--list-models`、
     minimax 最小 prompt、workbuddy 一句 hi、trae 积分接口、loomy ACP initialize、GUI 读模型目录）
     成功才到 `handshake`；只有 Trae 能判到 `quota`。卡片状态拆成固定三列（可达性 / 通道 / 额度），
-    `auth.via` 说明握手走哪条路，`auth.quota.kind` = `credits | request | unknown`——
+    **第一列看 `dispatch.ok` 而不是 `auth.level`**：Trae 的积分接口能通不代表客户端在跑，
+    CDP 9334 不在时显示 `未启动`，不能显示绿色 `可达`。`auth.via` 说明握手走哪条路，
+    `auth.quota.kind` = `credits | request | unknown`——
     「最小请求 200」只是 `request`，不会升级成「额度充足」。`/api/agents` 走快路径，
     `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），`&quota=1` 额外探额度（目前 qoder）；
     `auth.lastOkAt` 落盘 `~/.agent-hub/verify.json`，额度未知时显示「上次成功 X 分钟前」。

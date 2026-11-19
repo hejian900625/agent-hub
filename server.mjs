@@ -125,6 +125,37 @@ async function liveOf(a) {
  * 顺序很重要：先拿 live，再读运行时模型，最后用这些证据给登录态定级 ——
  * GUI 三家的「握手成功」判据就是「CDP 会话能读到模型目录」。
  */
+/**
+ * 派发可达性：登录态只说明「账号/凭据能过」，不代表现在真的能派活。
+ * Trae 就是典型 —— 积分能查（api.trae.cn），但客户端没开时 CDP 9334 根本不在，
+ * 派发会直接报「Trae CN 没有在运行」。所以卡片第一列必须看 dispatch，而不是 auth。
+ */
+function dispatchOf(a, live) {
+  // 注意：listAgents() 已经把 transports 压成 {name,kind} 数组，拿不到 .cdp.port，
+  // 所以端口以 live 为准，兜底用这里的固定值。
+  const port = live?.cdp?.port || live?.port || { trae: 9334, doubao: 9335, alice: 9333, scnet: 9336 }[a.id]
+  if (a.id === 'trae' || a.id === 'doubao' || a.id === 'alice' || a.id === 'scnet') {
+    const up = a.id === 'trae' ? !!live?.cdp?.up : !!live?.up
+    return up
+      ? { ok: true, via: `CDP ${live?.cdp?.port || live?.port || port}`, detail: 'CDP 调试端口可派发' }
+      : {
+          ok: false,
+          via: `CDP ${live?.cdp?.port || port}`,
+          detail:
+            a.id === 'trae'
+              ? '客户端未开或没带 --remote-debugging-port=9334（双击 start-debug.bat）'
+              : '客户端未开或调试端口未监听',
+        }
+  }
+  if (a.id === 'loomy') {
+    return live?.up
+      ? { ok: true, via: `HTTP ${String(live.base || live.port || '').replace('http://', '')}`, detail: '客户端在跑，走 HTTP 轨' }
+      : { ok: true, via: 'ACP（独立进程）', detail: '不需要客户端，起 opencode acp' }
+  }
+  const via = a.id === 'workbuddy' ? 'CLI stream-json' : a.id === 'minimax' ? 'ACP' : 'CLI stream-json'
+  return { ok: true, via, detail: 'CLI/ACP 轨，无需本地客户端' }
+}
+
 async function describeAgent(a, { fresh = false, verify = false, quotaProbe = false } = {}) {
   const live = await liveOf(a)
   // 运行时模型清单可覆盖注册表兜底（alice / doubao 必须问客户端）
@@ -155,7 +186,7 @@ async function describeAgent(a, { fresh = false, verify = false, quotaProbe = fa
     live,
     modelsFetched,
   })
-  return { ...a, models, auth, live }
+  return { ...a, models, auth, live, dispatch: dispatchOf(a, live) }
 }
 
 function serveStatic(req, res) {
