@@ -9,7 +9,7 @@ import { runAgent } from './core/runner.mjs'
 import { authStatus, startLogin } from './core/auth.mjs'
 import { loomyStatus } from './core/loomy-http.mjs'
 import { aliceStatus } from './core/alice-cdp.mjs'
-import { traeLive } from './core/trae-cn.mjs'
+import { traeLive, traeStatus } from './core/trae-cn.mjs'
 import { wbLive } from './core/workbuddy.mjs'
 import { traeCdpStatus } from './core/trae-cdp.mjs'
 import { doubaoStatus } from './core/doubao-cdp.mjs'
@@ -27,6 +27,7 @@ import {
   sandboxPrompt,
 } from './core/fanout.mjs'
 import { normalizeExpect, validateOutput, repairPrompt, describeExpect } from './core/contract.mjs'
+import { appendBill, readBills, summarize, normalizeUsage, mergeUsage, LEDGER_FILE } from './core/ledger.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const WEB = path.join(__dirname, 'web')
@@ -46,6 +47,21 @@ process.on('uncaughtException', (e) => {
 
 /** 运行中的任务表 */
 const runs = new Map() // runId -> {runId, agentId, prompt, cwd, startedAt, status, abort}
+
+const EMPTY_USAGE = {
+  input: null,
+  output: null,
+  cacheRead: null,
+  total: null,
+  costUsd: null,
+  credits: null,
+  source: 'none',
+  note: '',
+}
+
+/** 账单辅助查询最多等 3s，别让积分接口抖动把任务收尾拖住 */
+const soon = (p, ms = 3000) =>
+  Promise.race([p, new Promise((r) => setTimeout(() => r(null), ms))]).catch(() => null)
 
 /** 并行分发批次（沙箱 + 对比报告） */
 const fanoutBatches = new Map() // batchId -> batch
@@ -285,10 +301,17 @@ function executeRun({
     expect: contract ? { type: contract.type, retry: contract.retry } : null,
     groupId,
     cancellable: true,
+    usage: { ...EMPTY_USAGE },
   }
   runs.set(runId, rec)
 
   ;(async () => {
+    // Trae 不返回单次 token/费用，只能靠积分余额差值估实际消耗
+    if (agentId === 'trae') {
+      try {
+        rec.creditsBefore = (await soon(traeStatus()))?.credits ?? null
+      } catch {}
+    }
     const attempts = contract ? 1 + contract.retry : 1
     let lastErrors = []
     try {
@@ -313,6 +336,7 @@ function executeRun({
           concurrent,
           signal: ac.signal,
         })
+        if (r?.transport) rec.transport = r.transport
         if (ac.signal.aborted || r?.aborted) throw Object.assign(new Error('cancelled'), { name: 'AbortError' })
         // 有些轨（runCli / runTrae / runMinimax）是一次性把全文返回的，
         // 期间 SSE 可能没吐过 text 增量（比如 codebuddy 的 result 帧），
@@ -352,6 +376,24 @@ function executeRun({
       }
     } finally {
       rec.endedAt = Date.now()
+      if (!rec.billed) {
+        rec.billed = true
+        if (agentId === 'trae' && rec.creditsBefore != null) {
+          try {
+            const after = (await soon(traeStatus()))?.credits
+            if (after != null) {
+              const delta = Math.max(0, Number(rec.creditsBefore) - Number(after))
+              rec.usage = mergeUsage(rec.usage || EMPTY_USAGE, {
+                ...EMPTY_USAGE,
+                credits: delta,
+                source: 'credits-delta',
+                note: 'Trae 积分余额差值（并发跑同一账号时可能串账）',
+              })
+            }
+          } catch {}
+        }
+        appendBill(billOf(rec))
+      }
       runAborts.delete(runId)
       // 延迟清理，留给前端拉取
       setTimeout(() => runs.delete(runId), 10 * 60 * 1000)
@@ -633,6 +675,36 @@ bus.on('event', (ev) => {
   if (r) r.lastText = (r.lastText || '') + ev.delta
 })
 
+// 收集 usage：多轮 / 重试都累加，最终写成任务账单
+bus.on('event', (ev) => {
+  if (ev.type !== 'usage') return
+  const r = runs.get(ev.runId)
+  if (!r) return
+  r.usage = mergeUsage(r.usage || EMPTY_USAGE, normalizeUsage(ev.tokens || {}))
+})
+
+/** 一个 run 的最终账单（只记实际拿到的数字；未知保持 null） */
+function billOf(rec) {
+  const endedAt = rec.endedAt || Date.now()
+  const usage = rec.usage || EMPTY_USAGE
+  if (usage.source === 'none' && !usage.note) usage.note = '该轨未返回 usage（token/费用未知）'
+  return {
+    id: rec.runId,
+    ts: endedAt,
+    startedAt: rec.startedAt,
+    ms: Math.max(0, endedAt - rec.startedAt),
+    agentId: rec.agentId,
+    model: rec.model || null,
+    transport: rec.transport || null,
+    status: rec.status || 'unknown',
+    groupId: rec.groupId || null,
+    parentRunId: rec.parentRunId || null,
+    cwd: rec.cwd || null,
+    prompt: String(rec.prompt || '').replace(/\s+/g, ' ').trim().slice(0, 180),
+    usage,
+  }
+}
+
 /* ----------------------------- 路由 ----------------------------- */
 
 const server = http.createServer(async (req, res) => {
@@ -856,6 +928,23 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/runs' && req.method === 'GET') {
       return json(res, 200, {
         runs: [...runs.values()].map(({ lastText, ...r }) => ({ ...r, lastText: (lastText || '').slice(-8000) })),
+      })
+    }
+
+    if (url.pathname === '/api/bills' && req.method === 'GET') {
+      const q = url.searchParams
+      const limit = Math.min(2000, Math.max(1, Number(q.get('limit')) || 200))
+      const filter = { agent: q.get('agent'), group: q.get('group'), since: q.get('since') }
+      const { bills: all, warnings } = readBills({ ...filter, limit: 20000 })
+      const bills = all.slice(0, limit)
+      const allTime = readBills({ limit: 20000 })
+      return json(res, 200, {
+        ok: true,
+        file: LEDGER_FILE,
+        bills,
+        summary: summarize(bills),
+        allTime: summarize(allTime.bills),
+        warnings,
       })
     }
 

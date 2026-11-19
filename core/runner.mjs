@@ -258,7 +258,10 @@ function handleStreamJson(msg, { emit, setSession }) {
 
   if (type === 'result') {
     if (typeof msg.result === 'string' && msg.result.trim()) lastResult = msg.result
-    if (msg.usage) emit.usage(msg.usage)
+    // Qoder 的 total_credits、CodeBuddy 的 total_cost_usd 都在 result 帧上，
+    // 不能只取 msg.usage，否则账单里只剩 token、没有钱。
+    if (msg.usage || msg.total_cost_usd != null || msg.total_credits != null)
+      emit.usage({ ...(msg.usage || {}), costUsd: msg.total_cost_usd, credits: msg.total_credits })
     if (msg.is_error)
       emit.error(
         (msg.errors && msg.errors[0]) || msg.result || msg.error_code || 'cli result error',
