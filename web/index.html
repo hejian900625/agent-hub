@@ -155,32 +155,48 @@ async function verifyAgents(ids, { fresh = false } = {}) {
   await Promise.all([worker(), worker()])
 }
 
-/** 三级徽标：只有握手/额度是真结论，config 一律写「未验证」 */
+/**
+ * 状态色只有一个来源：行首方块和行内文字都取这里，避免同一行两种符号互相打架。
+ * 圆点/圆圈不再复用 —— 端口、服务、登录态一律用文字前缀表达。
+ */
+const LV_STYLE = {
+  quota: { color: '#22c55e', name: '可用' },
+  handshake: { color: '#f59e0b', name: '握手通过' },
+  config: { color: '#7d8da6', name: '配置就绪' },
+  none: { color: '#ef4444', name: '不可用' },
+}
+
+/** 徽标只输出文字（可带颜色），不再带 ●/○/◐ */
 function authBadgeOf(a) {
-  if (verifying.has(a.id) && a.auth?.level === 'config') {
-    return `<span style="color:#7d8da6;font-size:10px">⟳ 验证中…</span>`
-  }
-  const lv = a.auth?.level
-  const when = a.auth?.verifiedAt ? ` · 验证于 ${new Date(a.auth.verifiedAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''
+  const lv = a.auth?.level || 'none'
+  const when = a.auth?.verifiedAt
+    ? ` · 验证于 ${new Date(a.auth.verifiedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
+    : ''
   const tip = escAttr((a.auth?.detail || '') + when)
-  if (lv === 'quota') return `<span title="${tip}" style="color:#22c55e;font-size:10px">● 额度可用</span>`
-  if (lv === 'handshake') {
-    const broke = a.auth?.checks?.quota?.ok === false
-    return broke
-      ? `<span title="${tip}" style="color:#f59e0b;font-size:10px">◐ 握手通过 · 额度不足</span>`
-      : `<span title="${tip}" style="color:#38bdf8;font-size:10px">◐ 握手通过 · 额度未知</span>`
-  }
-  if (lv === 'config')
-    return a.auth?.verifiedAt
-      ? `<span title="${tip}" style="color:#f59e0b;font-size:10px">◔ 配置就绪 · 未握手</span>`
-      : `<span title="${tip}" style="color:#f59e0b;font-size:10px">◔ 仅凭据 · 未验证</span>`
-  if (a.auth?.status === 'n/a') return `<span style="color:#7d8da6;font-size:10px">${a.auth?.detail || 'GUI'}</span>`
-  return `<span class="login" data-id="${a.id}" title="${tip}" style="color:#ef4444;font-size:10px;cursor:pointer;text-decoration:underline">○ 未登录·点击登录</span>`
+  const color = (LV_STYLE[lv] || LV_STYLE.none).color
+
+  if (verifying.has(a.id) && lv === 'config')
+    return `<span style="color:#7d8da6;font-size:10px">验证中…</span>`
+  if (a.auth?.status === 'n/a')
+    return `<span title="${tip}" style="color:#7d8da6;font-size:10px">${a.auth?.detail || '无需登录'}</span>`
+
+  let text
+  if (lv === 'quota') text = `额度可用 · ${String(a.auth?.checks?.quota?.detail || '额度正常').split('，')[0]}`
+  else if (lv === 'handshake')
+    text = a.auth?.checks?.quota?.ok === false ? '握手通过 · 额度不足' : '握手通过 · 额度未知'
+  else if (lv === 'config') text = a.auth?.verifiedAt ? '配置就绪 · 未握手' : '仅凭据 · 未验证'
+  else text = '未登录 · 点击登录'
+
+  const cls = lv === 'none' ? ' class="login" data-id="' + a.id + '"' : ''
+  const extra = lv === 'none' ? 'cursor:pointer;text-decoration:underline;' : ''
+  return `<span${cls} title="${tip}" style="color:${color};font-size:10px;${extra}">${text}</span>`
 }
 
 function renderAgents() {
   $('#agents').innerHTML = agents.map((a) => {
     const live = a.live
+    const lv = a.auth?.level || 'none'
+    const dot = (LV_STYLE[lv] || LV_STYLE.none).color
     let liveBadge = ''
     if (live && a.id === 'trae') {
       // 积分已经由 auth 徽标展示，这里只说 CDP 能不能派发
@@ -190,27 +206,30 @@ function renderAgents() {
       // WorkBuddy 的 up = 有登录会话在等浏览器；models 来自桌面版 product.json
       const m = live.models ? `${live.models} 模型` : ''
       liveBadge = live.loginPending
-        ? `<span style="color:#22c55e;font-size:10px">● 正在登录</span> <span style="color:#7d8da6;font-size:10px">${m}</span>`
+        ? `<span style="color:#22c55e;font-size:10px">正在登录</span> <span style="color:#7d8da6;font-size:10px">${m}</span>`
         : `<span style="color:#7d8da6;font-size:10px">${m}</span>`
     } else if (live && a.id === 'doubao') {
       // 豆包只有 CDP 一条真轨，up = 调试端口通不通
       liveBadge = live.up
-        ? `<span style="color:#22c55e;font-size:10px">● CDP ${live.port} 就绪</span>`
-        : `<span style="color:#f59e0b;font-size:10px">○ CDP 未开（需 --remote-debugging-port=${live.port || 9335}）</span>`
+        ? `<span style="color:#22c55e;font-size:10px">端口 ${live.port} 就绪</span>`
+        : `<span style="color:#f59e0b;font-size:10px">端口 ${live.port || 9335} 未开（缺 --remote-debugging-port）</span>`
     } else if (live && a.id === 'scnet') {
       // SCNet 同样只有 CDP 一条真轨；额外提示要先清空 ELECTRON_RUN_AS_NODE
       liveBadge = live.up
-        ? `<span style="color:#22c55e;font-size:10px">● CDP ${live.port} 就绪</span> <span style="color:#7d8da6;font-size:10px">${a.defaultModel || ''}</span>`
-        : `<span style="color:#f59e0b;font-size:10px">○ CDP 未开（清 ELECTRON_RUN_AS_NODE + --remote-debugging-port=${live.port || 9336}）</span>`
+        ? `<span style="color:#22c55e;font-size:10px">端口 ${live.port} 就绪</span> <span style="color:#7d8da6;font-size:10px">${a.defaultModel || ''}</span>`
+        : `<span style="color:#f59e0b;font-size:10px">端口 ${live.port || 9336} 未开（先清 ELECTRON_RUN_AS_NODE）</span>`
     } else if (live) {
       liveBadge = live.up
-        ? `<span style="color:#22c55e;font-size:10px">● ${(live.base || 'CDP ' + live.port).replace('http://', '')}</span>`
-        : `<span style="color:#ef4444;font-size:10px">○ 未运行</span>`
+        ? `<span style="color:#22c55e;font-size:10px">${(live.base || '端口 ' + live.port).replace('http://', '')} 可连</span>`
+        : `<span style="color:#ef4444;font-size:10px">未运行</span>`
     }
     const authBadge = authBadgeOf(a)
+    const stateTip = escAttr(`${a.label}：${(LV_STYLE[lv] || LV_STYLE.none).name}${a.auth?.detail ? ` · ${a.auth.detail}` : ''}`)
     return `
     <div class="agent ${selected.has(a.id) ? 'sel' : ''}" data-id="${a.id}" style="--c:${a.accent}">
-      <div class="nm"><span class="sw"></span>${a.label}<span style="margin-left:auto;color:${a.installed ? '#22c55e' : '#ef4444'};font-size:11px">${a.installed ? '●' : '○'}</span></div>
+      <div class="nm"><span class="sw" style="background:${dot};box-shadow:0 0 0 3px ${dot}22" title="${stateTip}"></span>${a.label}${
+        a.installed ? '' : '<span style="margin-left:auto;color:#ef4444;font-size:10px">未安装</span>'
+      }</div>
       <div class="vd">${a.vendor} · ${authBadge}${liveBadge ? ' · ' + liveBadge : ''}</div>
       <div class="tags">
         ${a.transports.map((t) => `<span class="tag ${['acp','http','cdp','client'].includes(t.kind) ? 'hot' : ''}">${t.name}</span>`).join('')}
