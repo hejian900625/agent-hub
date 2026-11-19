@@ -107,6 +107,11 @@ agent-hub/
    （豆包 `Ctrl+N` 会跳到 `/chat/workbench`，那里根本没有输入框。）
 10. **SSE 增量事件会重复推**：Loomy 的 `message.part.updated` 对同一 tool part 推了 113 次，
     必须按 `part.id + status` 去重。别的 adapter 若出现「一行刷屏」也先查这个。
+11. **登录态是三级，不是布尔**：`level` = `none < config < handshake < quota`。
+    只看凭据文件只能到 `config`，界面必须写「仅凭据·未验证」；真握手（qoder `--list-models`、
+    minimax 最小 prompt、workbuddy 一句 hi、trae 积分接口、loomy ACP initialize、GUI 读模型目录）
+    成功才到 `handshake`；只有 Trae 能判到 `quota`。`/api/agents` 走快路径，
+    `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），别在页面首屏同步跑。
 
 ---
 
@@ -124,6 +129,8 @@ agent-hub/
 - SCNet 缺启动/完成两行 → 补 `emit.start()` / `emit.done()`
 - 链式流水第 2/3 棒空转或越权 → `parseSteps()` + `assignPrompt()`
 - Loomy 刷 200+ 行空白 `⚙ bash {}` → tool 事件按 `id+status` 去重
+- 「已登录」绿灯名不副实（只 stat 了 credential 文件）→ 三级状态 + 真实握手探测，
+  token 过期/积分归零不再显示成绿色
 
 ---
 

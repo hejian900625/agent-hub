@@ -111,18 +111,72 @@ async function loadAgents(fresh) {
   agents = r.agents
   renderAgents()
   renderTargets()
+  // 首屏只给本地层（快），真实握手在后台逐个补 —— 每张卡自己变绿
+  verifyAgents(agents.map((a) => a.id))
 }
+
+/* ---------- 真实握手验证（三级状态的后两档） ---------- */
+const verifying = new Set()
+const escAttr = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+
+async function verifyAgents(ids, { fresh = false } = {}) {
+  const queue = [...ids]
+  const worker = async () => {
+    while (queue.length) {
+      const id = queue.shift()
+      verifying.add(id)
+      renderAgents()
+      try {
+        const q = `/api/verify?agent=${encodeURIComponent(id)}${fresh ? '&fresh=1' : ''}`
+        const r = await fetch(q).then((x) => x.json())
+        const next = r.agents?.[0]
+        if (next) {
+          const i = agents.findIndex((x) => x.id === id)
+          if (i >= 0) agents[i] = next
+        }
+      } catch (e) {
+        log(`验证 ${id} 失败：${e.message}`, 'err')
+      }
+      verifying.delete(id)
+      renderAgents()
+      renderTargets()
+    }
+  }
+  // 并发 2：minimax/qoder 的探测各要 8~11s，起太多会把机器拖慢
+  await Promise.all([worker(), worker()])
+}
+
+/** 三级徽标：只有握手/额度是真结论，config 一律写「未验证」 */
+function authBadgeOf(a) {
+  if (verifying.has(a.id) && a.auth?.level === 'config') {
+    return `<span style="color:#7d8da6;font-size:10px">⟳ 验证中…</span>`
+  }
+  const lv = a.auth?.level
+  const when = a.auth?.verifiedAt ? ` · 验证于 ${new Date(a.auth.verifiedAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''
+  const tip = escAttr((a.auth?.detail || '') + when)
+  if (lv === 'quota') return `<span title="${tip}" style="color:#22c55e;font-size:10px">● 额度可用</span>`
+  if (lv === 'handshake') {
+    const broke = a.auth?.checks?.quota?.ok === false
+    return broke
+      ? `<span title="${tip}" style="color:#f59e0b;font-size:10px">◐ 握手通过 · 额度不足</span>`
+      : `<span title="${tip}" style="color:#38bdf8;font-size:10px">◐ 握手通过 · 额度未知</span>`
+  }
+  if (lv === 'config')
+    return a.auth?.verifiedAt
+      ? `<span title="${tip}" style="color:#f59e0b;font-size:10px">◔ 配置就绪 · 未握手</span>`
+      : `<span title="${tip}" style="color:#f59e0b;font-size:10px">◔ 仅凭据 · 未验证</span>`
+  if (a.auth?.status === 'n/a') return `<span style="color:#7d8da6;font-size:10px">${a.auth?.detail || 'GUI'}</span>`
+  return `<span class="login" data-id="${a.id}" title="${tip}" style="color:#ef4444;font-size:10px;cursor:pointer;text-decoration:underline">○ 未登录·点击登录</span>`
+}
+
 function renderAgents() {
   $('#agents').innerHTML = agents.map((a) => {
-    const ok = a.auth?.status === 'ok'
     const live = a.live
     let liveBadge = ''
     if (live && a.id === 'trae') {
-      const credit = live.credits != null ? live.credits + ' 积分' : '积分?'
+      // 积分已经由 auth 徽标展示，这里只说 CDP 能不能派发
       const cdpOn = live.cdp?.up
-      liveBadge = live.up
-        ? `<span style="color:#22c55e;font-size:10px">● ${credit}</span> <span style="color:${cdpOn ? '#22c55e' : '#f59e0b'};font-size:10px">${cdpOn ? 'CDP 就绪' : 'CDP 未开'}</span>`
-        : `<span style="color:#ef4444;font-size:10px">○ 客户端未登录</span>`
+      liveBadge = `<span style="color:${cdpOn ? '#22c55e' : '#f59e0b'};font-size:10px">${cdpOn ? 'CDP 就绪' : 'CDP 未开'}</span>`
     } else if (live && a.id === 'workbuddy') {
       // WorkBuddy 的 up = 有登录会话在等浏览器；models 来自桌面版 product.json
       const m = live.models ? `${live.models} 模型` : ''
@@ -144,11 +198,7 @@ function renderAgents() {
         ? `<span style="color:#22c55e;font-size:10px">● ${(live.base || 'CDP ' + live.port).replace('http://', '')}</span>`
         : `<span style="color:#ef4444;font-size:10px">○ 未运行</span>`
     }
-    const authBadge = ok
-      ? `<span style="color:#22c55e;font-size:10px">已登录</span>`
-      : a.auth?.status === 'n/a'
-        ? `<span style="color:#7d8da6;font-size:10px">${a.auth?.detail || 'GUI'}</span>`
-        : `<span class="login" data-id="${a.id}" style="color:#f59e0b;font-size:10px;cursor:pointer;text-decoration:underline">未登录·点击登录</span>`
+    const authBadge = authBadgeOf(a)
     return `
     <div class="agent ${selected.has(a.id) ? 'sel' : ''}" data-id="${a.id}" style="--c:${a.accent}">
       <div class="nm"><span class="sw"></span>${a.label}<span style="margin-left:auto;color:${a.installed ? '#22c55e' : '#ef4444'};font-size:11px">${a.installed ? '●' : '○'}</span></div>
@@ -175,7 +225,12 @@ function renderAgents() {
       log(r.ok ? `已启动登录流程 (pid ${r.pid})：${r.cmd}${extra}` : `登录失败：${r.error}`, r.ok ? 'sys' : 'err')
       if (r.ok) {
         // 登录态是异步落盘的：先快刷两次（6s / 15s），再慢刷几次兜住扫码慢的情况
-        ;[6000, 15000, 40000, 90000].forEach((ms) => setTimeout(() => loadAgents(true), ms))
+        ;[6000, 15000, 40000, 90000].forEach((ms) =>
+          setTimeout(async () => {
+            await loadAgents(true)
+            verifyAgents([el.dataset.id], { fresh: true })
+          }, ms)
+        )
       }
     }
   })
@@ -372,8 +427,9 @@ $('#prompt').addEventListener('keydown', (e) => {
 $('#clear').onclick = () => { logEl.innerHTML = ''; for (const k in inflight) delete inflight[k] }
 
 $('#reauth').onclick = async () => {
-  log('正在重新探测登录状态…', 'sys')
+  log('正在逐家做真实握手（qoder ~8s / minimax ~11s / workbuddy ~10s）…', 'sys')
   await loadAgents(true)
+  await verifyAgents(agents.map((a) => a.id), { fresh: true })
   log('登录状态已刷新', 'sys')
 }
 loadAgents().then(() => {

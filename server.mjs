@@ -62,6 +62,71 @@ async function body(req) {
   }
 }
 
+/* ------------------------- agent 状态描述 ------------------------- */
+
+/** 实时可执行性（进程 / CDP / opencode 端口），与登录态分开看 */
+async function liveOf(a) {
+  try {
+    if (a.id === 'loomy') {
+      const live = await loomyStatus()
+      // 顺带告诉界面这次会走哪条轨，以及该轨能用哪些模型
+      live.track = live.up ? 'http' : 'acp'
+      live.tracks = { http: 'imodel/*（需开客户端）', acp: 'opencode/*（独立进程）' }
+      return live
+    }
+    if (a.id === 'alice') return await aliceStatus()
+    if (a.id === 'trae') {
+      // 积分/登录态来自 storage.json 解密；额外带上 CDP 可执行性
+      const credits = await traeLive()
+      const cdp = await traeCdpStatus(a.transports.client?.port || 9334)
+      return { ...credits, cdp }
+    }
+    if (a.id === 'doubao') return await doubaoStatus(a.transports.cdp?.port || 9335)
+    if (a.id === 'scnet') return await scnetStatus(a.transports.cdp?.port || 9336)
+    if (a.id === 'workbuddy') return await wbLive()
+    return null
+  } catch (e) {
+    return { up: false, error: e.message }
+  }
+}
+
+/**
+ * 一个 agent 的完整卡片数据。
+ * 顺序很重要：先拿 live，再读运行时模型，最后用这些证据给登录态定级 ——
+ * GUI 三家的「握手成功」判据就是「CDP 会话能读到模型目录」。
+ */
+async function describeAgent(a, { fresh = false, verify = false } = {}) {
+  const live = await liveOf(a)
+  // 运行时模型清单可覆盖注册表兜底（alice / doubao 必须问客户端）
+  let models = a.models
+  let modelsFetched = 0
+  try {
+    if (a.id === 'alice' && live?.up) {
+      const ms = await aliceModels(a.transports.cdp?.port || 9333)
+      if (ms.length) {
+        models = ms.map((m) => m.id)
+        modelsFetched = ms.length
+      }
+    }
+    if (a.id === 'doubao' && live?.up) {
+      const ms = await doubaoModels(a.transports.cdp?.port || 9335)
+      if (ms.length) {
+        models = ms
+        modelsFetched = ms.length
+      }
+    }
+  } catch {
+    /* 保留兜底 */
+  }
+  const auth = await authStatus(a.id, {
+    fresh,
+    verify: verify || a.id === 'trae',
+    live,
+    modelsFetched,
+  })
+  return { ...a, models, auth, live }
+}
+
 function serveStatic(req, res) {
   const url = new URL(req.url, 'http://localhost')
   let p = url.pathname === '/' ? '/index.html' : url.pathname
@@ -331,54 +396,28 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/api/agents' && req.method === 'GET') {
+      const q = url.searchParams
       const agents = await Promise.all(
-        listAgents().map(async (a) => {
-          const auth = await authStatus(a.id, { fresh: url.searchParams.get('fresh') === '1' })
-          let live = null
-          // 运行时模型清单可覆盖注册表兜底（alice / doubao 必须问客户端）
-          let models = a.models
-          try {
-            if (a.id === 'loomy') {
-              live = await loomyStatus()
-              // 顺带告诉界面这次会走哪条轨，以及该轨能用哪些模型
-              live.track = live.up ? 'http' : 'acp'
-              live.tracks = { http: 'imodel/*（需开客户端）', acp: 'opencode/*（独立进程）' }
-            }
-            else if (a.id === 'alice') live = await aliceStatus()
-            else if (a.id === 'trae') {
-              // 积分/登录态来自 storage.json 解密；额外带上 CDP 可执行性
-              const credits = await traeLive()
-              const cdp = await traeCdpStatus(a.transports.client?.port || 9334)
-              live = { ...credits, cdp }
-            } else if (a.id === 'doubao') {
-              // 豆包只有 CDP 一条真轨，live 就是「调试端口通不通」
-              live = await doubaoStatus(a.transports.cdp?.port || 9335)
-            } else if (a.id === 'scnet') {
-              live = await scnetStatus(a.transports.cdp?.port || 9336)
-            } else if (a.id === 'workbuddy') {
-              live = await wbLive()
-            }
-          } catch (e) {
-            live = { up: false, error: e.message }
-          }
-          // Alice / 豆包 的模型清单只能问客户端：Alice 走 window.alice.fetchMiyangModelCatalog()，
-          // 豆包要真实点开输入框右下角的下拉读列表。CDP 没开就用注册表里的兜底子集。
-          if (a.id === 'alice' && live?.up) {
-            try {
-              const ms = await aliceModels(a.transports.cdp?.port || 9333)
-              if (ms.length) models = ms.map((m) => m.id)
-            } catch { /* 保留兜底 */ }
-          }
-          if (a.id === 'doubao' && live?.up) {
-            try {
-              const ms = await doubaoModels(a.transports.cdp?.port || 9335)
-              if (ms.length) models = ms
-            } catch { /* 保留兜底 */ }
-          }
-          return { ...a, models, auth, live }
-        })
+        listAgents().map((a) =>
+          describeAgent(a, { fresh: q.get('fresh') === '1', verify: q.get('verify') === '1' })
+        )
       )
       return json(res, 200, { agents })
+    }
+
+    // 真实握手验证：一次只验一家（前端按并发 2 逐个打，避免同时起 4 个重进程）
+    if (url.pathname === '/api/verify' && (req.method === 'GET' || req.method === 'POST')) {
+      const q = url.searchParams
+      const b = req.method === 'POST' ? await body(req) : {}
+      const id = q.get('agent') || b.agent
+      if (!id) return json(res, 400, { ok: false, error: 'missing agent' })
+      const list = listAgents()
+      const targets = id === 'all' ? list : list.filter((a) => a.id === id)
+      if (!targets.length) return json(res, 404, { ok: false, error: `unknown agent: ${id}` })
+      const out = await Promise.all(
+        targets.map((a) => describeAgent(a, { fresh: q.get('fresh') === '1', verify: true }))
+      )
+      return json(res, 200, { ok: true, agents: out })
     }
 
     if (url.pathname === '/api/login' && req.method === 'POST') {

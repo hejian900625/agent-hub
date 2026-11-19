@@ -695,18 +695,46 @@ if (!toolIds.has(id)) {
 
 ## 8. 登录状态徽标是怎么判断的
 
-`core/auth.mjs` 的 `authStatus(agentId)` 只看**该 CLI 自己读的那个文件**，猜错就会一直显示「未登录」。
-2026-11-17 实测校准后的真路径：
+**别再只看 credential 文件。** 文件在 ≠ token 有效 ≠ 有额度：token 过期、积分耗尽、账号被限流时，
+文件都还在。2026-11-19 起 `core/auth.mjs` 把状态拆成三级，徽标只认后两级：
+
+| 级别 | 含义 | 怎么得到 |
+|---|---|---|
+| `config` | 只确认本地配置/凭据存在 | 读文件、看应用是否安装 |
+| `handshake` | **真的发过一次轻量请求且成功** | 见下表 |
+| `quota` | 握手成功且额度可判定为可用 | 目前只有 Trae 能给出（积分接口） |
+
+拿不到额度数据的家（qoder / workbuddy / minimax / loomy / doubao / alice / scnet）一律停在
+`handshake`，界面写「额度未知」，不冒充「够用」。
+
+| Agent | config 判据 | handshake 真实请求 | 成本 |
+|---|---|---|---|
+| qoder | `~/.qoder/.auth/user` | `qodercli --list-models`（带身份拉目录，顺便拿到 17 个模型） | ~9–14s |
+| minimax | `auth-state.json` 里 `status=authenticated` 且未过期 | `mcode exec` 一句最小 prompt（`provider test` 对 OAuth 返回 unsupported，用不了） | ~9–14s |
+| workbuddy | CLI + 桌面版 `product.json`（该版本不落盘凭证） | `-p --output-format json --model auto "hi"`，看 `subtype=success` | ~11–16s |
+| trae | 解密 `storage.json` 的 `iCubeAuthInfo` | `POST api.trae.cn/.../ide_user_ent_usage`，401 才判失效 | ~0.5s |
+| loomy | `opencode.exe` 存在 | `opencode acp` → ACP `initialize`（不需要开客户端） | ~1–2s |
+| doubao / alice | 客户端 exe 存在 | CDP 端口通 **且** 能读到模型目录（读不到 = 可能停在登录页） | 视客户端 |
+| scnet | 客户端 exe 存在 | CDP 端口通 **且** 页面在任务页（固定 `SCNet-Max`，无可枚举目录） | 视客户端 |
+
+两级接口：
+
+- `GET /api/agents` —— 快，只给 `config` 层（trae 例外，它便宜）
+- `GET /api/verify?agent=<id>&fresh=1` —— 跑真实握手，结果缓存 5 分钟；前端首屏后用并发 2 在后台补齐
+
+界面徽标：`● 额度可用`（绿）/ `◐ 握手通过 · 额度未知`（蓝）/ `◐ 握手通过 · 额度不足`（黄，积分=0）/
+`◔ 仅凭据 · 未验证`（黄，未握手）/ `○ 未登录 · 点击登录`（红）。鼠标悬停可看具体证据与验证时间。
+
+各家凭据文件的真路径（2026-11-17 校准，猜错就会一直显示「未登录」）：
 
 | Agent | 判据 | 备注 |
 |---|---|---|
-| qoder | `~/.qoder/.auth/user`（1368 字节加密 blob，无扩展名） | 不是 `credentials.json`；`.credential-transaction` 是 0 字节锁文件，用它判会永远 missing |
-| minimax | `~/.minimax/auth/prod/cn/mcode-public/auth-state.json` 里 `status === 'authenticated'` 且 `expiresAtMs` 未过期 | 光看文件存在不够 |
-| workbuddy | **真跑一次请求**：`-p --output-format json --model auto "hi"`，看 `subtype=success`；结果缓存 8s | 凭证文件落点随版本变（`~/.credentials.json`、`~/credentials.json`、`~/.workbuddy/*` 实测都没写），所以不猜文件，直接看可不可用 |
-| trae | 解密 `%APPDATA%\Trae CN\User\globalStorage\storage.json` 的 `iCubeAuthInfo://icube.cloudide`（AES-128-CBC），再查 `ide_user_ent_usage` 数据；结果缓存 60s | token 未过期且接口 200 = ok，详情列「3600 积分·用户·有效期」 |
-| doubao / loomy / alice | `n/a` | 桌面应用，登录态在客户端自身 |
+| qoder | `~/.qoder/.auth/user`（1368 字节加密 blob，无扩展名） | 不是 `credentials.json`；`.credential-transaction` 是 0 字节锁文件 |
+| minimax | `~/.minimax/auth/prod/cn/mcode-public/auth-state.json` | 光看文件存在不够，还看 `status` 与 `expiresAtMs` |
+| workbuddy | 上面这些位置实测都不写 | 所以只能靠握手 |
+| trae | `%APPDATA%\Trae CN\User\globalStorage\storage.json` 的 `iCubeAuthInfo://icube.cloudide` | AES-128-CBC 解密后再验 |
 
-界面上：`刷新登录状态` 按钮 → `GET /api/agents?fresh=1`（强制绕过 30s 缓存重查）。
+界面上：`刷新登录状态` 按钮 → 逐家 `GET /api/verify?agent=<id>&fresh=1`（绕过 5 分钟缓存）。
 点「未登录 · 点击登录」拉起登录流程后，前端会 6 秒后自动 `loadAgents(true)`，徽标自己转绿，不用手刷。
 
 ## 9. 加一个新 agent
