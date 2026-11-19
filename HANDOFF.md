@@ -110,8 +110,11 @@ agent-hub/
 11. **登录态是三级，不是布尔**：`level` = `none < config < handshake < quota`。
     只看凭据文件只能到 `config`，界面必须写「仅凭据·未验证」；真握手（qoder `--list-models`、
     minimax 最小 prompt、workbuddy 一句 hi、trae 积分接口、loomy ACP initialize、GUI 读模型目录）
-    成功才到 `handshake`；只有 Trae 能判到 `quota`。`/api/agents` 走快路径，
-    `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），别在页面首屏同步跑。
+    成功才到 `handshake`；只有 Trae 能判到 `quota`。卡片状态拆成固定三列（可达性 / 通道 / 额度），
+    `auth.via` 说明握手走哪条路，`auth.quota.kind` = `credits | request | unknown`——
+    「最小请求 200」只是 `request`，不会升级成「额度充足」。`/api/agents` 走快路径，
+    `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），`&quota=1` 额外探额度（目前 qoder）；
+    `auth.lastOkAt` 落盘 `~/.agent-hub/verify.json`，额度未知时显示「上次成功 X 分钟前」。
 12. **并行分发一律走 `/api/fanout`，不要并发打 `/api/run`**：前者会给每个 target 建
     `<cwd>/<agent>-<时间戳>/` 沙箱（复制源目录、跳过 node_modules/.git/dist），跑完自动出
     `fanout-<batchId>.report.json`（新增/修改/删除 + 两两差异）。并发打 `/api/run` 共用
@@ -148,6 +151,10 @@ agent-hub/
 - 并行分发同名文件互相覆盖 → `/api/fanout` 每 target 独立沙箱 + 跑完 diff 报告
 - 链式流水把上一步的原始回复直接喂下游 → 每步 `expect` 契约 + 校验 + 带错重试 + 跳过后继
 - 链式跑到一半发现方向错了只能干等 → AbortController 贯穿全链，级联取消在途 adapter + 跳过未派发步骤
+- 状态串把「握手」和「端口」并列成两件事（SCNet 的握手本来就是 CDP）→ 固定三列：可达性 / 通道 / 额度，
+  `auth.via` 写明握手走的哪条通道
+- 7/8 家额度未知 → `quota.kind` 三态（credits/request/unknown）+ qoder 按需最小请求探针 +
+  `lastOkAt` 落盘，界面给「上次成功 X 分钟前」
 
 ---
 
@@ -162,7 +169,7 @@ agent-hub/
 5. **MiniMax 只有 2 个真模型**（`minimax/MiniMax-M3`、`minimax/MiniMax-M3.1-Flash`），
    其他 id 传进去不报错而是**静默回退**，别以为选成功了。
 6. **`fanoutGate` 只看 UA**，用非 Node/curl 的脚本（比如 Python requests 带自定义 UA）可能绕过。
-7. 前端没有「取消运行」按钮；`AcpClient.cancel()` 已实现但 UI 没接。
+7. `lastOkAge` 是服务端算好的快照；页面常驻时前端改用 `lastOkAt` 现算，刷新页面才会重新拉。
 
 ---
 
