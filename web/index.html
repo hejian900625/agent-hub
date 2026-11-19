@@ -28,6 +28,10 @@
   .agent.sel{border-color:var(--c);box-shadow:0 0 0 1px var(--c) inset}
   .agent .nm{display:flex;align-items:center;gap:8px;font-weight:600}
   .agent .vd{color:var(--dim);font-size:11px;margin-top:2px;line-height:1.7}
+  .agent .cols{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 4px}
+  .agent .cols .sep{color:#334155}
+  .agent .qp{color:#38bdf8;font-size:10px;cursor:pointer;text-decoration:underline;margin-left:2px}
+  .agent .qp:hover{color:#7dd3fc}
   .agent .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
   .tag{font-size:10px;padding:1px 6px;border-radius:999px;background:#0f172a;color:var(--dim);border:1px solid var(--line)}
   .tag.hot{color:var(--c);border-color:color-mix(in srgb,var(--c) 40%,transparent)}
@@ -128,7 +132,7 @@ async function loadAgents(fresh) {
 const verifying = new Set()
 const escAttr = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 
-async function verifyAgents(ids, { fresh = false } = {}) {
+async function verifyAgents(ids, { fresh = false, quota = false } = {}) {
   const queue = [...ids]
   const worker = async () => {
     while (queue.length) {
@@ -136,7 +140,7 @@ async function verifyAgents(ids, { fresh = false } = {}) {
       verifying.add(id)
       renderAgents()
       try {
-        const q = `/api/verify?agent=${encodeURIComponent(id)}${fresh ? '&fresh=1' : ''}`
+        const q = `/api/verify?agent=${encodeURIComponent(id)}${fresh ? '&fresh=1' : ''}${quota ? '&quota=1' : ''}`
         const r = await fetch(q).then((x) => x.json())
         const next = r.agents?.[0]
         if (next) {
@@ -166,71 +170,85 @@ const LV_STYLE = {
   none: { color: '#ef4444', name: '不可用' },
 }
 
-/** 徽标只输出文字（可带颜色），不再带 ●/○/◐ */
-function authBadgeOf(a) {
-  const lv = a.auth?.level || 'none'
-  const when = a.auth?.verifiedAt
-    ? ` · 验证于 ${new Date(a.auth.verifiedAt).toLocaleTimeString('zh-CN', { hour12: false })}`
-    : ''
-  const tip = escAttr((a.auth?.detail || '') + when)
-  const color = (LV_STYLE[lv] || LV_STYLE.none).color
-
-  if (verifying.has(a.id) && lv === 'config')
-    return `<span style="color:#7d8da6;font-size:10px">验证中…</span>`
-  if (a.auth?.status === 'n/a')
-    return `<span title="${tip}" style="color:#7d8da6;font-size:10px">${a.auth?.detail || '无需登录'}</span>`
-
-  let text
-  if (lv === 'quota') text = `额度可用 · ${String(a.auth?.checks?.quota?.detail || '额度正常').split('，')[0]}`
-  else if (lv === 'handshake')
-    text = a.auth?.checks?.quota?.ok === false ? '握手通过 · 额度不足' : '握手通过 · 额度未知'
-  else if (lv === 'config') text = a.auth?.verifiedAt ? '配置就绪 · 未握手' : '仅凭据 · 未验证'
-  else text = '未登录 · 点击登录'
-
-  const cls = lv === 'none' ? ' class="login" data-id="' + a.id + '"' : ''
-  const extra = lv === 'none' ? 'cursor:pointer;text-decoration:underline;' : ''
-  return `<span${cls} title="${tip}" style="color:${color};font-size:10px;${extra}">${text}</span>`
+/**
+ * 状态拆成固定三列，别再把「握手结果」和「端口」并列成两件事：
+ *   可达性 —— 不可用 / 仅配置 / 可达
+ *   通道   —— 这次握手到底走哪条路（CDP 9336、CLI --list-models、ACP initialize…）
+ *   额度   —— 精确余额，或「请求 200 但余额未暴露」，或「未知 + 上次成功时间」
+ */
+const REACH_STYLE = {
+  up: { color: '#22c55e', text: '可达' },
+  config: { color: '#7d8da6', text: '仅配置' },
+  down: { color: '#ef4444', text: '不可用' },
+  'n/a': { color: '#7d8da6', text: '无需登录' },
 }
+
+function viaOf(a) {
+  if (a.auth?.via) return a.auth.via
+  const live = a.live || {}
+  const guiPort = { doubao: 9335, alice: 9333, scnet: 9336 }[a.id]
+  if (guiPort) return `CDP ${live.port || guiPort}`
+  if (a.id === 'trae') return `CDP ${live.cdp?.port || 9334}`
+  if (a.id === 'loomy') return live.up ? `HTTP ${live.port}` : 'ACP initialize'
+  if (a.id === 'minimax') return 'CLI / ACP'
+  return 'CLI'
+}
+
+function quotaOf(a) {
+  const q = a.auth?.quota
+  const when = q?.checkedAt ? `（${agoText(q.checkedAt)}）` : ''
+  if (q?.ok === true && q.kind === 'credits') return `额度可用 · ${String(q.detail || '额度正常').split('，')[0]}${when}`
+  if (q?.ok === true) return `请求 200 · 余额未暴露${when}`
+  if (q?.ok === false) return `额度异常 · ${q.detail || '未知原因'}`
+  const age = a.auth?.lastOkAt ? agoText(a.auth.lastOkAt) : ''
+  return age ? `额度未知 · 上次成功 ${age}` : '额度未知'
+}
+
+/** 把时间戳说成人话；页面常驻时也能跟着当前时间走，不用等后端重算 */
+function agoText(ts) {
+  const n = Number(ts)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  const m = Math.max(0, Math.round((Date.now() - n) / 60000))
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.round(m / 60)
+  return h < 48 ? `${h} 小时前` : `${Math.round(h / 24)} 天前`
+}
+
+/** 只有这三家的「探测额度」会真的多打一次请求；其余没有额度接口 */
+const QUOTA_PROBES = new Set(['qoder', 'workbuddy', 'minimax'])
 
 function renderAgents() {
   $('#agents').innerHTML = agents.map((a) => {
     const live = a.live
     const lv = a.auth?.level || 'none'
     const dot = (LV_STYLE[lv] || LV_STYLE.none).color
-    let liveBadge = ''
-    if (live && a.id === 'trae') {
-      // 积分已经由 auth 徽标展示，这里只说 CDP 能不能派发
-      const cdpOn = live.cdp?.up
-      liveBadge = `<span style="color:${cdpOn ? '#22c55e' : '#f59e0b'};font-size:10px">${cdpOn ? 'CDP 就绪' : 'CDP 未开'}</span>`
-    } else if (live && a.id === 'workbuddy') {
-      // WorkBuddy 的 up = 有登录会话在等浏览器；models 来自桌面版 product.json
-      const m = live.models ? `${live.models} 模型` : ''
-      liveBadge = live.loginPending
-        ? `<span style="color:#22c55e;font-size:10px">正在登录</span> <span style="color:#7d8da6;font-size:10px">${m}</span>`
-        : `<span style="color:#7d8da6;font-size:10px">${m}</span>`
-    } else if (live && a.id === 'doubao') {
-      // 豆包只有 CDP 一条真轨，up = 调试端口通不通
-      liveBadge = live.up
-        ? `<span style="color:#22c55e;font-size:10px">端口 ${live.port} 就绪</span>`
-        : `<span style="color:#f59e0b;font-size:10px">端口 ${live.port || 9335} 未开（缺 --remote-debugging-port）</span>`
-    } else if (live && a.id === 'scnet') {
-      // SCNet 同样只有 CDP 一条真轨；额外提示要先清空 ELECTRON_RUN_AS_NODE
-      liveBadge = live.up
-        ? `<span style="color:#22c55e;font-size:10px">端口 ${live.port} 就绪</span> <span style="color:#7d8da6;font-size:10px">${a.defaultModel || ''}</span>`
-        : `<span style="color:#f59e0b;font-size:10px">端口 ${live.port || 9336} 未开（先清 ELECTRON_RUN_AS_NODE）</span>`
-    } else if (live) {
-      liveBadge = live.up
-        ? `<span style="color:#22c55e;font-size:10px">${(live.base || '端口 ' + live.port).replace('http://', '')} 可连</span>`
-        : `<span style="color:#ef4444;font-size:10px">未运行</span>`
-    }
-    const authBadge = authBadgeOf(a)
-    const stateTip = escAttr(`${a.label}：${(LV_STYLE[lv] || LV_STYLE.none).name}${a.auth?.detail ? ` · ${a.auth.detail}` : ''}`)
+    const reach = a.auth?.status === 'n/a' ? 'n/a' : lv === 'none' ? 'down' : lv === 'config' ? 'config' : 'up'
+    const rs = REACH_STYLE[reach]
+    const via = viaOf(a)
+    const quota = verifying.has(a.id)
+      ? '探测中…'
+      : live?.loginPending
+        ? '等待浏览器登录'
+        : quotaOf(a)
+    // 没有精确余额的（7/8 家）给一个按需探针：发一条最小请求看返回码
+    const probe = !verifying.has(a.id) && QUOTA_PROBES.has(a.id) && a.auth?.quota?.kind !== 'credits'
+      ? `<span class="qp" data-id="${a.id}" title="发一条最小请求，区分 200 / 401 / 429 / 额度耗尽">探测额度</span>`
+      : ''
+    const loginCls = reach === 'down' ? ' class="login"' : ''
+    const stateTip = escAttr(
+      `${a.label}：${(LV_STYLE[lv] || LV_STYLE.none).name}${a.auth?.detail ? ` · ${a.auth.detail}` : ''}${a.auth?.lastOkAt ? ` · 上次成功 ${agoText(a.auth.lastOkAt)}` : ''}`
+    )
     return `
     <div class="agent ${selected.has(a.id) ? 'sel' : ''}" data-id="${a.id}" style="--c:${a.accent}">
       <div class="nm"><span class="sw" style="background:${dot};box-shadow:0 0 0 3px ${dot}22" title="${stateTip}"></span>${a.label}${
         a.installed ? '' : '<span style="margin-left:auto;color:#ef4444;font-size:10px">未安装</span>'
       }</div>
-      <div class="vd">${a.vendor} · ${authBadge}${liveBadge ? ' · ' + liveBadge : ''}</div>
+      <div class="vd cols">
+        <span${loginCls}${reach === 'down' ? ` data-id="${a.id}"` : ''} style="color:${rs.color}">${rs.text}${reach === 'down' ? '（点击登录）' : ''}</span>
+        <span class="sep">·</span><span>通道 ${esc(via)}</span>
+        <span class="sep">·</span><span>${esc(quota)}</span>${probe}
+      </div>
       <div class="tags">
         ${a.transports.map((t) => `<span class="tag ${['acp','http','cdp','client'].includes(t.kind) ? 'hot' : ''}">${t.name}</span>`).join('')}
       </div>
@@ -260,6 +278,12 @@ function renderAgents() {
           }, ms)
         )
       }
+    }
+  })
+  document.querySelectorAll('.qp').forEach((el) => {
+    el.onclick = (ev) => {
+      ev.stopPropagation()
+      verifyAgents([el.dataset.id], { fresh: true, quota: true })
     }
   })
 }
