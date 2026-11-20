@@ -449,12 +449,21 @@ const modelOf = new Map() // agentId -> 该 agent 选中的模型
 function currentAgent() { const ids = [...selected]; return ids.length === 1 ? ids[0] : null }
 
 /** 某 agent 该用的模型：用户选过且仍有效 → 用它；否则 defaultModel → 列表首项。 */
+function modelSupported(agentId, m) {
+  const a = agents.find((x) => x.id === agentId)
+  // Loomy 不开客户端时只有 ACP 轨，imodel/* 是外壳注入的 provider，ACP 根本认不到
+  if (agentId === 'loomy' && a && !a.live?.up) return !String(m).startsWith('imodel/')
+  return true
+}
+
 function modelFor(agentId) {
   const a = agents.find((x) => x.id === agentId)
   const list = (a && a.models) || []
   if (!list.length) return undefined
+  const usable = list.filter((m) => modelSupported(agentId, m))
+  const pool = usable.length ? usable : list
   const want = modelOf.get(agentId)
-  return list.includes(want) ? want : (a.defaultModel && list.includes(a.defaultModel) ? a.defaultModel : list[0])
+  return pool.includes(want) ? want : (a.defaultModel && pool.includes(a.defaultModel) ? a.defaultModel : pool[0])
 }
 
 /** 为每个选中的 agent 各渲染一个下拉。没有模型的 agent（纯 GUI）显示不可选提示。 */
@@ -478,7 +487,10 @@ function renderModel() {
     }
     return `<div class="mrow"><b style="color:${accent}">${a.label}</b>`
       + `<select data-model-for="${id}" style="min-width:210px">`
-      + list.map((m) => `<option value="${esc(m)}"${m === modelFor(id) ? ' selected' : ''}>${esc(m)}</option>`).join('')
+      + list.map((m) => {
+        const ok = modelSupported(id, m)
+        return `<option value="${esc(m)}"${m === modelFor(id) ? ' selected' : ''}${ok ? '' : ' disabled'}>${esc(m)}${ok ? '' : '（需开客户端）'}</option>`
+      }).join('')
       + `</select></div>`
   }).join('')
 
@@ -507,6 +519,15 @@ async function dispatch() {
   const ids = [...selected]
   if (!prompt) return log('请先输入指令', 'sys')
   if (!ids.length) return log('请先在左侧选择 agent', 'sys')
+  const bad = ids
+    .map((id) => ({ id, model: modelFor(id) }))
+    .filter((x) => x.model && !modelSupported(x.id, x.model))
+  if (bad.length) {
+    return log(
+      `模型与当前通道不匹配：${bad.map((x) => `${label(x.id)} ${x.model}`).join('、')}。Loomy 客户端未开时只能选 opencode/*。`,
+      'err'
+    )
+  }
 
   if (mode === 'single') {
     const { runId } = await post('/api/run', { agent: ids[0], prompt, cwd, model: modelFor(ids[0]) })

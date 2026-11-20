@@ -11,7 +11,7 @@
 | **WorkBuddy** | `codebuddy` / `cbc` (2.184.0) + `D:\Program Files\WorkBuddy` 桌面版 product.json | ⚠️ `--acp`（能握手但回 refusal，不用） | ✅ `-p --output-format stream-json --model <id>` | SDK `control_request/authenticate` 登录桥 / `--serve`（REST+SSE+WebUI）/ 后台会话 `ps/attach/kill` | ✅ 已打通（45 个模型可选，链式编排已验证） |
 | **MiniMax** | `mcode` (0.7.7) | ✅ `acp` | ✅ `exec` | `app-server` / `computer-use` | ✅ 已打通（走 Electron 内嵌 Node 24.19 绕开 ABI 146 vs 137） |
 | **Doubao** | `DoubaoWork.exe` (2.32.14) | — | ✅ CDP 驱动 | `--remote-debugging-port=9335` + DOM | ✅ 已打通（Chrome 147 / ProseMirror / 真实 Enter） |
-| **Loomy** | `opencode.exe acp`（`D:\Program Files\Loomy` 只是外壳，**不需要启动**） | ✅ `opencode acp`（默认轨） | ✅ 本地 HTTP API（需开客户端） | **`opencode serve` 随机端口 + SSE**；`opencode-kernel` | ✅ ACP 直连可用（无需客户端） |
+| **Loomy** | `opencode.exe acp`（`D:\Program Files\Loomy` 只是外壳，**不需要启动**） | ✅ `opencode acp`（默认轨） | ✅ 本地 HTTP API（需开客户端） | **`opencode serve` 随机端口 + SSE**；`opencode-kernel` | ✅ ACP 直连可用（无需客户端，但只认 `opencode/*`） |
 | **Alice** | `Alice.exe`（Electron + 本地 worker） | — | ✅ CDP 驱动 | `window.alice` ~900 方法 / persona 文件 | ✅ 直连可用（已实测） |
 | **SCNet** | `计算服务.exe` (4.2.0，曙光智算) | — | ✅ CDP 驱动 | `--remote-debugging-port=9336` + 清空 `ELECTRON_RUN_AS_NODE`；CLI 只读（status/doctor/logs/diagnose）| ✅ 已打通（Chrome 152 / tiptap / SCNet-Max） |
 
@@ -215,6 +215,11 @@ opencode serve --hostname=127.0.0.1 --port=<随机>
 | 不指定 | 客户端开着 → http / 没开 → acp | 兜底 |
 
 失败会互相回退：http 挂了且有 `canAcp` 就转 ACP；ACP 挂了且有 `canHttp` 就转 http。日志里能看到 `loomy 轨：http（imodel/* 只有 http 轨认）`。
+
+**状态页必须反映这个限制**：客户端没开时 Loomy 不是「完全可派发」，而是
+`部分可用` + `会话 可建（限 ACP）` + `模型 1/8 可用` + `通道 ACP（仅 opencode/*）`；
+默认模型自动落到 `opencode/hy4-flash-free`，下拉里的 `imodel/*` 标记「需开客户端」并禁用。
+否则界面会显示绿色 `可派发`，一点就报「opencode 服务未找到」。
 
 **额度差异**（本机实测）：`imodel/*` 走讯飞侧额度、7 个里 6 个能跑；`opencode/*` 走 OpenCode Go，**只有 `opencode/hy4-flash-free` 免费额度够**，其他全报 `Insufficient balance`。
 
@@ -802,7 +807,7 @@ if (!toolIds.has(id)) {
 
 | 位置 | 取值 |
 |---|---|
-| 主状态 | `可派发`（绿，能建会话）/ `部分可用`（黄，会话不可达但额度或模型还能查）/ `未启动`（黄，GUI 客户端没跑）/ `仅配置`（灰，CLI 尚未握手）/ `不可用（点击登录）`（红）/ `无需登录` |
+| 主状态 | `可派发`（绿，能建会话）/ `部分可用`（黄，只能部分派发，或会话不可达但额度/模型还能查）/ `未启动`（黄，GUI 客户端没跑）/ `仅配置`（灰，CLI 尚未握手）/ `不可用（点击登录）`（红）/ `无需登录` |
 | 额度 / 会话 / 模型 | 三条独立链路各给一个徽标：绿=可用、红=不可用、灰=未验证。会话一档是主状态的唯一依据 |
 | 通道 | 实际派发通道：`CDP 9334`、`CLI stream-json`、`ACP`、`HTTP 127.0.0.1:4325`…；握手方式在 tooltip 的 `auth.via` |
 
@@ -810,7 +815,8 @@ if (!toolIds.has(id)) {
 Trae 就是反例：积分接口能通（`api.trae.cn`，3600 积分），但客户端没启动时 CDP 9334 不在，
 派发会直接失败 —— 这时显示 `部分可用` + `会话 不可达` + `通道 CDP 9334 未监听`，
 而不是用「未启动」把「额度可查」也一起否掉，更不会显示绿色 `可派发`。
-Doubao / Alice 同理；Loomy 断客户端时会自动落到 ACP 轨，仍算可派发。
+Doubao / Alice 同理；Loomy 断客户端时只能走 ACP 的 `opencode/*`，卡片显示 `部分可用`，
+不会再冒充完全可派发。
 CLI 类（Qoder / WorkBuddy / MiniMax）在还没握手时 `session` 是「未验证」而不是「不可达」，
 对应主状态 `仅配置`，避免把「还没问」说成「不能派」。
 

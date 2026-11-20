@@ -43,7 +43,7 @@ Start-Process -FilePath 'D:\nodejs\node.exe' -ArgumentList 'server.mjs' `
 | **WorkBuddy** | CLI stream-json | 无（已登录）；**不带 `--model` 必 400** |
 | **MiniMax** | ACP（走 Electron 内嵌 Node 24.19） | 无；只有 2 个真模型 |
 | **Doubao** | CDP 9335 | `DoubaoWork.exe --remote-debugging-port=9335` |
-| **Loomy** | HTTP（opencode 内核）或 ACP | 开 Loomy 客户端（它会自己拉 `opencode serve`，端口随机） |
+| **Loomy** | HTTP（opencode 内核）或 ACP | 用 `imodel/*` 必须开客户端（它会自己拉 `opencode serve`，端口随机）；不开只能走 ACP 的 `opencode/*` |
 | **Alice** | CDP 9333 | `Alice.exe --remote-debugging-port=9333` |
 | **SCNet** | CDP 9336 | **先清空 `ELECTRON_RUN_AS_NODE`**，见下 |
 
@@ -117,6 +117,8 @@ agent-hub/
     Trae 的积分接口能通不代表客户端在跑，CDP 9334 不在时显示 `部分可用` + `会话 不可达` +
     `CDP 9334 未监听`，不能显示绿色 `可派发`。CLI 类尚未握手时 `session.ok = null`（未验证），
     主状态落 `仅配置`，别把「还没问」写成「不可达」。`auth.via` 说明握手走哪条路，
+    Loomy 还有模型级限制：客户端没开时 ACP 只认 `opencode/*`，主状态是 `部分可用`，
+    默认模型自动切到 `opencode/hy4-flash-free`，`imodel/*` 在下拉里禁用。
     `auth.quota.kind` = `credits | request | unknown`——
     「最小请求 200」只是 `request`，不会升级成「额度充足」。`/api/agents` 走快路径，
     `/api/verify?agent=<id>` 才发真实请求（缓存 5 分钟），`&quota=1` 额外探额度（目前 qoder）；

@@ -166,7 +166,11 @@ function dispatchOf(a, live) {
   if (a.id === 'loomy') {
     return live?.up
       ? { ok: true, via: `HTTP ${String(live.base || live.port || '').replace('http://', '')}`, detail: '客户端在跑，走 HTTP 轨' }
-      : { ok: true, via: 'ACP（独立进程）', detail: '不需要客户端，起 opencode acp' }
+      : {
+          ok: true,
+          via: 'ACP（仅 opencode/*）',
+          detail: '客户端未开：ACP 独立进程可用，但 imodel/* 只能走 HTTP，必须先开客户端',
+        }
   }
   const via = a.id === 'workbuddy' ? 'CLI stream-json' : a.id === 'minimax' ? 'ACP' : 'CLI stream-json'
   return { ok: true, via, detail: 'CLI/ACP 轨，无需本地客户端' }
@@ -200,8 +204,18 @@ function capabilitiesOf(a, auth, live, models, modelsFetched, dispatch) {
     sessionOk = !!live?.up && live?.running !== false
     sessionWhy = sessionOk ? '' : !live?.up ? 'CDP 未监听' : '页面不在任务页（可能未登录）'
   } else if (id === 'loomy') {
-    sessionOk = !!dispatch?.ok
-    sessionWhy = sessionOk ? '' : 'ACP 不可用'
+    const opencodeModels = (Array.isArray(models) ? models : []).filter((m) => String(m).startsWith('opencode/'))
+    if (live?.up) {
+      sessionOk = true
+      sessionWhy = '客户端在跑，HTTP 轨可用'
+    } else if (opencodeModels.length) {
+      // ACP 独立进程确实能建会话，但只认 opencode/*；不能因此把整行说成完全可用
+      sessionOk = true
+      sessionWhy = 'ACP 可用，仅 opencode/*；imodel/* 需要先开客户端'
+    } else {
+      sessionOk = false
+      sessionWhy = '没有可用的 ACP 模型'
+    }
   } else {
     const hs = auth.checks?.handshake
     if (auth.level === 'none') sessionOk = false
@@ -213,11 +227,16 @@ function capabilitiesOf(a, auth, live, models, modelsFetched, dispatch) {
   let modelCap
   if (id === 'alice' || id === 'doubao') modelCap = modelsFetched > 0 ? { ok: true, text: `${count} 个` } : { ok: null, text: '未知' }
   else if (id === 'scnet') modelCap = { ok: true, text: 'SCNet-Max' }
+  else if (id === 'loomy' && !live?.up) {
+    const openCount = (Array.isArray(models) ? models : []).filter((m) => String(m).startsWith('opencode/')).length
+    modelCap = openCount ? { ok: true, text: `${openCount}/${count} 可用` } : { ok: false, text: '无可用模型' }
+  }
   else modelCap = count > 0 ? { ok: true, text: `${count} 个` } : { ok: null, text: '未知' }
 
   const anyCap = quota.ok === true || modelCap.ok === true
   let primary
   if (auth.level === 'none') primary = 'down'
+  else if (id === 'loomy' && !live?.up) primary = sessionOk ? 'partial' : 'idle'
   else if (sessionOk === true) primary = 'ready'
   else if (sessionOk === false) primary = anyCap ? 'partial' : 'idle'
   else primary = 'config'
@@ -228,7 +247,18 @@ function capabilitiesOf(a, auth, live, models, modelsFetched, dispatch) {
   return {
     primary,
     quota,
-    session: { ok: sessionOk, text: sessionOk === true ? '可建' : sessionOk === false ? '不可达' : '未验证', why: sessionWhy },
+    session: {
+      ok: sessionOk,
+      text:
+        sessionOk === true
+          ? id === 'loomy' && !live?.up
+            ? '可建（限 ACP）'
+            : '可建'
+          : sessionOk === false
+            ? '不可达'
+            : '未验证',
+      why: sessionWhy,
+    },
     models: modelCap,
     channel: channelText,
   }
@@ -265,7 +295,13 @@ async function describeAgent(a, { fresh = false, verify = false, quotaProbe = fa
     modelsFetched,
   })
   const dispatch = dispatchOf(a, live)
-  return { ...a, models, auth, live, dispatch, capabilities: capabilitiesOf(a, auth, live, models, modelsFetched, dispatch) }
+  // Loomy 没开客户端时必须把默认模型落到 ACP 认的 opencode/*；
+  // registry 里的 imodel/auto 只适用于 HTTP 轨，直接拿来当默认会一跑就报「服务未找到」。
+  const defaultModel =
+    a.id === 'loomy' && !live?.up
+      ? models.find((m) => String(m).startsWith('opencode/')) || a.defaultModel
+      : a.defaultModel
+  return { ...a, models, defaultModel, auth, live, dispatch, capabilities: capabilitiesOf(a, auth, live, models, modelsFetched, dispatch) }
 }
 
 function serveStatic(req, res) {
